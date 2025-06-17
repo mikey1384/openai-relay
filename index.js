@@ -1,15 +1,21 @@
 import { createServer } from 'node:http';
 import { fetch } from 'undici';
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const PORT = process.env.PORT || 3000;
+const RELAY_SECRET = process.env.RELAY_SECRET;
+
+// Validate required environment variables
+if (!RELAY_SECRET) {
+  console.error('❌ RELAY_SECRET environment variable is required');
+  process.exit(1);
+}
 
 // Enhanced relay for translator app - supports both transcription and translation
 const server = createServer(async (req, res) => {
   // Enable CORS for all origins (restrict in production)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key');
 
   // Handle preflight requests
   if (req.method === 'OPTIONS') {
@@ -39,10 +45,19 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Validate OpenAI API key
-  if (!OPENAI_API_KEY) {
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'OpenAI API key not configured' }));
+  // Validate relay authorization
+  const relaySecret = req.headers['x-relay-secret'];
+  if (relaySecret !== RELAY_SECRET) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized - invalid relay secret' }));
+    return;
+  }
+
+  // Extract OpenAI API key from request headers
+  const openaiApiKey = req.headers['x-openai-key'];
+  if (!openaiApiKey) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Missing OpenAI API key header' }));
     return;
   }
 
@@ -69,7 +84,7 @@ const server = createServer(async (req, res) => {
     body = await new Promise((resolve, reject) => {
       let chunks = [];
       let size = 0;
-      const maxSize = 25 * 1024 * 1024; // 25MB limit for audio files
+      const maxSize = 200 * 1024 * 1024; // 200MB limit to match stage5-api
 
       req.on('data', chunk => {
         size += chunk.length;
@@ -101,7 +116,7 @@ const server = createServer(async (req, res) => {
       method: 'POST',
       headers: {
         'Content-Type': contentType,
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Authorization': `Bearer ${openaiApiKey}`,
         'User-Agent': 'translator-relay/1.0.0',
       },
       body: body,
@@ -199,6 +214,9 @@ server.listen(PORT, () => {
   console.log(`📡 Endpoints:`);
   console.log(`   POST /transcribe - Audio transcription proxy`);
   console.log(`   POST /translate - Chat completion proxy`);
+  console.log(`   POST /v1/audio/transcriptions - OpenAI SDK compatible`);
+  console.log(`   POST /v1/chat/completions - OpenAI SDK compatible`);
+  console.log(`🔐 Security: Requires X-Relay-Secret header`);
   console.log(`🌏 Ready to serve clients in restricted regions`);
 });
 
