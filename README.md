@@ -33,7 +33,7 @@ The server will start on `http://localhost:3000` with hot reload.
 curl -X POST http://localhost:3000/translate \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o-mini",
+    "model": "gpt-4.1",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 
@@ -102,7 +102,7 @@ Proxy to OpenAI's chat completions API.
 **Body:**
 ```json
 {
-  "model": "gpt-4o-mini",
+  "model": "gpt-4.1",
   "messages": [
     {"role": "user", "content": "Text to translate"}
   ],

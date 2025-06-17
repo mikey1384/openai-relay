@@ -28,10 +28,10 @@ const server = createServer(async (req, res) => {
   let targetUrl;
   let contentType = req.headers['content-type'] || 'application/json';
 
-  // Route to appropriate OpenAI endpoint
-  if (url.pathname === '/transcribe') {
+  // Route to appropriate OpenAI endpoint - support both direct and SDK paths
+  if (url.pathname === '/transcribe' || url.pathname === '/v1/audio/transcriptions') {
     targetUrl = 'https://api.openai.com/v1/audio/transcriptions';
-  } else if (url.pathname === '/translate') {
+  } else if (url.pathname === '/translate' || url.pathname === '/v1/chat/completions') {
     targetUrl = 'https://api.openai.com/v1/chat/completions';
   } else {
     res.writeHead(404, { 'Content-Type': 'application/json' });
