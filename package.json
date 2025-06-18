@@ -1,13 +1,13 @@
 {
   "name": "openai-relay",
   "version": "1.0.0",
-  "description": "OpenAI API relay for regions with restricted access",
-  "main": "index.js",
+  "description": "Minimal OpenAI relay server for geographic bypass",
   "type": "module",
+  "main": "dist/index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
   },
   "keywords": [
     "openai",
@@ -19,9 +19,15 @@
   "author": "Mikey Lee",
   "license": "ISC",
   "dependencies": {
-    "undici": "^6.0.0"
+    "formidable": "^3.5.4",
+    "openai": "^5.5.1"
+  },
+  "devDependencies": {
+    "@types/formidable": "^3.4.5",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
   }
 }

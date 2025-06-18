@@ -9,11 +9,14 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production && npm cache clean --force
+# Install ALL dependencies (including devDependencies for TypeScript build)
+RUN npm ci && npm cache clean --force
 
 # Copy source code
 COPY . .
+
+# Build TypeScript
+RUN npm run build
 
 # Create non-root user
 RUN addgroup -g 1001 -S nodejs
@@ -29,5 +32,5 @@ EXPOSE 3000
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]
 
-# Start the server
-CMD ["node", "index.js"] 
+# Start the server with the correct path
+CMD ["node", "dist/index.js"] 
