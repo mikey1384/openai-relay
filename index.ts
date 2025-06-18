@@ -142,13 +142,13 @@ const server = createServer(async (req, res) => {
             return;
           }
 
-          console.log(`🌐 Translating to: ${target_language} with model: ${model || 'gpt-4'}`);
+          console.log(`🌐 Translating to: ${target_language} with model: ${model || 'gpt-4.1'}`);
 
           // Create OpenAI client and translate
           const openai = makeOpenAI(openaiKey);
           
           const completion = await openai.chat.completions.create({
-            model: model || 'gpt-4',
+            model: model || 'gpt-4.1',
             messages: [
               {
                 role: 'system',
@@ -159,8 +159,7 @@ const server = createServer(async (req, res) => {
                 content: text
               }
             ],
-            temperature: temperature || 0.3,
-            max_tokens: 4000,
+            temperature: temperature || 0.3
           });
 
           const translatedText = completion.choices[0]?.message?.content || '';
@@ -172,7 +171,7 @@ const server = createServer(async (req, res) => {
           res.end(JSON.stringify({
             translated_text: translatedText,
             target_language: target_language,
-            model: model || 'gpt-4'
+            model: model || 'gpt-4.1'
           }));
         } catch (parseError: any) {
           console.error('❌ Relay translation parse error:', parseError.message);
