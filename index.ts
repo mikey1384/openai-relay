@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { IncomingForm } from "formidable";
 import { makeOpenAI } from "./openai-config.js";
+import { DEFAULT_TRANSLATION_MODEL } from "./constants.js";
 
 const PORT = process.env.PORT || 3000;
 
@@ -173,7 +174,7 @@ const server = createServer(async (req, res) => {
 
           console.log(
             `🌐 Translating to: ${target_language} with model: ${
-              model || "gpt-5"
+              model || DEFAULT_TRANSLATION_MODEL
             }`
           );
 
@@ -181,7 +182,7 @@ const server = createServer(async (req, res) => {
           const openai = makeOpenAI(openaiKey);
 
           const completion = await openai.chat.completions.create({
-            model: model || "gpt-5",
+            model: model || DEFAULT_TRANSLATION_MODEL,
             messages: [
               {
                 role: "system",
@@ -205,7 +206,7 @@ const server = createServer(async (req, res) => {
             JSON.stringify({
               translated_text: translatedText,
               target_language: target_language,
-              model: model || "gpt-5",
+              model: model || DEFAULT_TRANSLATION_MODEL,
             })
           );
         } catch (parseError: any) {
