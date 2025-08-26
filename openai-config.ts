@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import Groq from "groq-sdk";
 
 export function makeOpenAI(apiKey: string) {
   return new OpenAI({
@@ -9,10 +10,7 @@ export function makeOpenAI(apiKey: string) {
 }
 
 export function makeGroq(apiKey: string) {
-  return new OpenAI({
-    apiKey: apiKey,
-    baseURL: "https://api.groq.com/openai/v1",
-    timeout: 60_000,
-    maxRetries: 3,
+  return new Groq({
+    apiKey,
   });
 }
