@@ -7,3 +7,12 @@ export function makeOpenAI(apiKey: string) {
     maxRetries: 3,
   });
 }
+
+export function makeGroq(apiKey: string) {
+  return new OpenAI({
+    apiKey: apiKey,
+    baseURL: "https://api.groq.com/openai/v1",
+    timeout: 60_000,
+    maxRetries: 3,
+  });
+}

@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { IncomingForm } from "formidable";
-import { makeOpenAI } from "./openai-config.js";
+import { makeOpenAI, makeGroq } from "./openai-config.js";
 import { DEFAULT_TRANSLATION_MODEL } from "./constants.js";
 
 const PORT = process.env.PORT || 3000;
@@ -17,7 +17,7 @@ const server = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key"
+    "Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key, X-Groq-Key"
   );
 
   // Handle preflight requests
@@ -33,26 +33,23 @@ const server = createServer(async (req, res) => {
     console.log("📡 Processing transcribe request...");
 
     // Validate relay secret
-    const relaySecret = req.headers["x-relay-secret"];
-    if (!relaySecret) {
-      console.log("❌ Missing relay secret");
+    const relaySecretHeader = req.headers["x-relay-secret"];
+    const providedSecret = Array.isArray(relaySecretHeader)
+      ? relaySecretHeader[0]
+      : relaySecretHeader;
+    const expectedSecret = process.env.RELAY_SECRET;
+    if (
+      !providedSecret ||
+      !expectedSecret ||
+      providedSecret !== expectedSecret
+    ) {
+      console.log("❌ Invalid or missing relay secret");
       res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - missing relay secret" }));
+      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
       return;
     }
 
-    // Get OpenAI API key from headers
-    const openaiKey = req.headers["x-openai-key"] as string;
-    if (!openaiKey) {
-      console.log("❌ Missing OpenAI API key");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
-      return;
-    }
-
-    console.log(
-      "🎯 Relay secret and OpenAI key validated, processing transcription..."
-    );
+    console.log("🎯 Relay secret validated, processing transcription...");
 
     try {
       // Parse the multipart form data
@@ -81,10 +78,34 @@ const server = createServer(async (req, res) => {
         `🎵 Transcribing file: ${file.originalFilename} (${file.size} bytes) with model: ${model}`
       );
 
-      // Create OpenAI client and transcribe
-      const openai = makeOpenAI(openaiKey);
+      // Determine which key and client to use based on model
+      let client;
+      let usedProvider = "";
+      if (model === "whisper-large-v3") {
+        const groqKey = req.headers["x-groq-key"] as string;
+        if (!groqKey) {
+          console.log("❌ Missing Groq API key for whisper-large-v3");
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized - missing Groq key" }));
+          return;
+        }
+        client = makeGroq(groqKey);
+        usedProvider = "Groq";
+      } else {
+        const openaiKey = req.headers["x-openai-key"] as string;
+        if (!openaiKey) {
+          console.log("❌ Missing OpenAI API key");
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ error: "Unauthorized - missing OpenAI key" })
+          );
+          return;
+        }
+        client = makeOpenAI(openaiKey);
+        usedProvider = "OpenAI";
+      }
 
-      // Read the file and create a proper File object for OpenAI
+      // Read the file and create a proper File object
       const fs = await import("fs");
       const fileBuffer = await fs.promises.readFile(file.filepath);
       const fileBlob = new File(
@@ -95,7 +116,7 @@ const server = createServer(async (req, res) => {
         }
       );
 
-      const transcription = await openai.audio.transcriptions.create({
+      const transcription = await client.audio.transcriptions.create({
         file: fileBlob,
         model: model,
         language: language || undefined,
@@ -104,7 +125,9 @@ const server = createServer(async (req, res) => {
         timestamp_granularities: ["word", "segment"],
       });
 
-      console.log("🎯 Relay transcription completed successfully!");
+      console.log(
+        `🎯 Relay transcription completed successfully using ${usedProvider}!`
+      );
 
       // Send the real transcription result
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -128,11 +151,19 @@ const server = createServer(async (req, res) => {
     console.log("🌐 Processing translate request...");
 
     // Validate relay secret
-    const relaySecret = req.headers["x-relay-secret"];
-    if (!relaySecret) {
-      console.log("❌ Missing relay secret");
+    const relaySecretHeader = req.headers["x-relay-secret"];
+    const providedSecret = Array.isArray(relaySecretHeader)
+      ? relaySecretHeader[0]
+      : relaySecretHeader;
+    const expectedSecret = process.env.RELAY_SECRET;
+    if (
+      !providedSecret ||
+      !expectedSecret ||
+      providedSecret !== expectedSecret
+    ) {
+      console.log("❌ Invalid or missing relay secret");
       res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - missing relay secret" }));
+      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
       return;
     }
 
