@@ -81,7 +81,7 @@ const server = createServer(async (req, res) => {
       // Determine which key and client to use based on model
       let client;
       let usedProvider = "";
-      if (model === "whisper-large-v3") {
+      if (model === "whisper-large-v3" || model === "whisper-large-v3-turbo") {
         const groqKey = req.headers["x-groq-key"] as string;
         if (!groqKey) {
           console.log("❌ Missing Groq API key for whisper-large-v3");
@@ -146,7 +146,9 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Handle POST to /translate
+  // Handle POST to /translate (supports two modes):
+  // 1) Simple text translation: { text, target_language, model, temperature }
+  // 2) Chat style translation: { messages, model, temperature } (OpenAI chat.completions compatible)
   if (req.method === "POST" && req.url === "/translate") {
     console.log("🌐 Processing translate request...");
 
@@ -189,9 +191,27 @@ const server = createServer(async (req, res) => {
 
       req.on("end", async () => {
         try {
-          const { text, target_language, model, temperature } =
-            JSON.parse(body);
+          const parsed = JSON.parse(body);
+          const openai = makeOpenAI(openaiKey);
 
+          // Branch: chat-style translation passthrough
+          if (Array.isArray(parsed?.messages)) {
+            const { messages, model, temperature } = parsed;
+
+            const completion = await openai.chat.completions.create({
+              model: model || DEFAULT_TRANSLATION_MODEL,
+              messages,
+              temperature: typeof temperature === "number" ? temperature : 0.3,
+            });
+
+            console.log("🎯 Relay chat translation completed successfully!");
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(completion));
+            return;
+          }
+
+          // Simple text translation mode
+          const { text, target_language, model, temperature } = parsed;
           if (!text || !target_language) {
             console.log("❌ Missing required fields: text or target_language");
             res.writeHead(400, { "Content-Type": "application/json" });
@@ -209,9 +229,6 @@ const server = createServer(async (req, res) => {
             }`
           );
 
-          // Create OpenAI client and translate
-          const openai = makeOpenAI(openaiKey);
-
           const completion = await openai.chat.completions.create({
             model: model || DEFAULT_TRANSLATION_MODEL,
             messages: [
@@ -224,14 +241,12 @@ const server = createServer(async (req, res) => {
                 content: text,
               },
             ],
-            temperature: temperature || 0.3,
+            temperature: typeof temperature === "number" ? temperature : 0.3,
           });
 
           const translatedText = completion.choices[0]?.message?.content || "";
 
           console.log("🎯 Relay translation completed successfully!");
-
-          // Send the translation result
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
