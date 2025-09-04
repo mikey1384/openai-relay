@@ -4,7 +4,7 @@ import Groq from "groq-sdk";
 export function makeOpenAI(apiKey: string) {
   return new OpenAI({
     apiKey: apiKey,
-    timeout: 60_000, // 1 minute for direct calls
+    timeout: 600_000, // 10 minutes for long-running requests (e.g., gpt-5)
     maxRetries: 3,
   });
 }
