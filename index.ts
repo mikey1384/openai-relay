@@ -197,24 +197,31 @@ const server = createServer(async (req, res) => {
           // Branch: chat-style translation passthrough
           if (Array.isArray(parsed?.messages)) {
             const { messages, model, temperature, reasoning } = parsed as any;
+            const isGpt5 = String(model || DEFAULT_TRANSLATION_MODEL).startsWith("gpt-5");
 
             let completion;
             try {
-              completion = await openai.chat.completions.create({
+              const req: any = {
                 model: model || DEFAULT_TRANSLATION_MODEL,
                 messages,
-                temperature: typeof temperature === "number" ? temperature : 0.3,
                 ...(reasoning ? { reasoning } : {}),
-              });
+              };
+              if (!isGpt5 && typeof temperature === "number") {
+                req.temperature = temperature;
+              }
+              completion = await openai.chat.completions.create(req);
             } catch (err: any) {
               const status = err?.status || err?.response?.status;
               const msg = String(err?.message || "").toLowerCase();
               if (reasoning && (status === 400 || msg.includes("reasoning"))) {
-                completion = await openai.chat.completions.create({
+                const req2: any = {
                   model: model || DEFAULT_TRANSLATION_MODEL,
                   messages,
-                  temperature: typeof temperature === "number" ? temperature : 0.3,
-                });
+                };
+                if (!isGpt5 && typeof temperature === "number") {
+                  req2.temperature = temperature;
+                }
+                completion = await openai.chat.completions.create(req2);
               } else {
                 throw err;
               }
