@@ -196,13 +196,29 @@ const server = createServer(async (req, res) => {
 
           // Branch: chat-style translation passthrough
           if (Array.isArray(parsed?.messages)) {
-            const { messages, model, temperature } = parsed;
+            const { messages, model, temperature, reasoning } = parsed as any;
 
-            const completion = await openai.chat.completions.create({
-              model: model || DEFAULT_TRANSLATION_MODEL,
-              messages,
-              temperature: typeof temperature === "number" ? temperature : 0.3,
-            });
+            let completion;
+            try {
+              completion = await openai.chat.completions.create({
+                model: model || DEFAULT_TRANSLATION_MODEL,
+                messages,
+                temperature: typeof temperature === "number" ? temperature : 0.3,
+                ...(reasoning ? { reasoning } : {}),
+              });
+            } catch (err: any) {
+              const status = err?.status || err?.response?.status;
+              const msg = String(err?.message || "").toLowerCase();
+              if (reasoning && (status === 400 || msg.includes("reasoning"))) {
+                completion = await openai.chat.completions.create({
+                  model: model || DEFAULT_TRANSLATION_MODEL,
+                  messages,
+                  temperature: typeof temperature === "number" ? temperature : 0.3,
+                });
+              } else {
+                throw err;
+              }
+            }
 
             console.log("🎯 Relay chat translation completed successfully!");
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -211,7 +227,7 @@ const server = createServer(async (req, res) => {
           }
 
           // Simple text translation mode
-          const { text, target_language, model, temperature } = parsed;
+          const { text, target_language, model, temperature } = parsed as any;
           if (!text || !target_language) {
             console.log("❌ Missing required fields: text or target_language");
             res.writeHead(400, { "Content-Type": "application/json" });
