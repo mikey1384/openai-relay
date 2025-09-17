@@ -1,9 +1,218 @@
 import { createServer } from "node:http";
+import { Buffer } from "node:buffer";
 import { IncomingForm } from "formidable";
+import { randomUUID } from "node:crypto";
 import { makeOpenAI, makeGroq } from "./openai-config.js";
 import { DEFAULT_TRANSLATION_MODEL } from "./constants.js";
 
 const PORT = process.env.PORT || 3000;
+
+const MAX_TTS_CHARS_PER_CHUNK = 3_500;
+
+type TranslationJobStatus = "queued" | "processing" | "completed" | "failed";
+
+type ChatJobPayload = {
+  mode: "chat";
+  messages: Array<{ role: string; content: string }>;
+  model: string;
+  temperature?: number;
+  reasoning?: any;
+};
+
+type TextJobPayload = {
+  mode: "text";
+  text: string;
+  target_language: string;
+  model: string;
+  temperature?: number;
+};
+
+type TranslationJob = {
+  id: string;
+  status: TranslationJobStatus;
+  createdAt: number;
+  updatedAt: number;
+  payload: ChatJobPayload | TextJobPayload;
+  openaiKey: string;
+  result?: any;
+  error?: { message: string; details?: string };
+};
+
+const translationJobs = new Map<string, TranslationJob>();
+
+function readJsonBody(req: any): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+    });
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function chunkLines(lines: string[], maxChars: number): string[] {
+  const trimmed = lines.map((line) =>
+    typeof line === "string" ? line.trim() : ""
+  );
+  const filtered = trimmed.filter(Boolean);
+  const chunks: string[] = [];
+  let current = "";
+
+  const flush = () => {
+    if (current.trim()) {
+      chunks.push(current.trim());
+    }
+    current = "";
+  };
+
+  for (const line of filtered) {
+    if (!line) continue;
+    if (line.length > maxChars) {
+      flush();
+      for (let i = 0; i < line.length; i += maxChars) {
+        const piece = line.slice(i, i + maxChars).trim();
+        if (piece) {
+          chunks.push(piece);
+        }
+      }
+      continue;
+    }
+
+    if (!current) {
+      current = line;
+      continue;
+    }
+
+    if (current.length + 1 + line.length > maxChars) {
+      flush();
+      current = line;
+    } else {
+      current = `${current}\n${line}`;
+    }
+  }
+
+  flush();
+  return chunks;
+}
+
+function pruneTranslationJobs(maxAgeMs = 1000 * 60 * 60) {
+  const now = Date.now();
+  for (const [jobId, job] of translationJobs) {
+    if (
+      (job.status === "completed" || job.status === "failed") &&
+      now - job.createdAt > maxAgeMs
+    ) {
+      translationJobs.delete(jobId);
+    }
+  }
+}
+
+async function processTranslationJob(job: TranslationJob): Promise<void> {
+  job.status = "processing";
+  job.updatedAt = Date.now();
+
+  try {
+    const client = makeOpenAI(job.openaiKey);
+    const payload = job.payload;
+    const model = payload.model || DEFAULT_TRANSLATION_MODEL;
+    const isGpt5 = String(model).startsWith("gpt-5");
+
+    if (payload.mode === "chat") {
+      const { messages, temperature, reasoning } = payload;
+
+      const request: any = {
+        model,
+        messages,
+      };
+
+      if (reasoning !== undefined) {
+        request.reasoning = reasoning;
+      }
+
+      if (
+        !isGpt5 &&
+        typeof temperature === "number" &&
+        Number.isFinite(temperature)
+      ) {
+        request.temperature = temperature;
+      }
+
+      let completion;
+
+      try {
+        completion = await client.chat.completions.create(request);
+      } catch (maybeReasoningError: any) {
+        const status =
+          maybeReasoningError?.status || maybeReasoningError?.response?.status;
+        const msg = String(maybeReasoningError?.message || "").toLowerCase();
+        if (reasoning && (status === 400 || msg.includes("reasoning"))) {
+          const reqWithoutReasoning: any = { model, messages };
+          if (
+            !isGpt5 &&
+            typeof temperature === "number" &&
+            Number.isFinite(temperature)
+          ) {
+            reqWithoutReasoning.temperature = temperature;
+          }
+          completion = await client.chat.completions.create(
+            reqWithoutReasoning
+          );
+        } else {
+          throw maybeReasoningError;
+        }
+      }
+
+      job.result = completion;
+    } else {
+      const { text, target_language, temperature } = payload;
+
+      const request: any = {
+        model,
+        messages: [
+          {
+            role: "system",
+            content: `You are a professional translator. Translate the following text to ${target_language}. Only return the translated text, nothing else.`,
+          },
+          {
+            role: "user",
+            content: text,
+          },
+        ],
+      };
+
+      if (
+        !isGpt5 &&
+        typeof temperature === "number" &&
+        Number.isFinite(temperature)
+      ) {
+        request.temperature = temperature;
+      }
+
+      const completion = await client.chat.completions.create(request);
+      job.result = completion;
+    }
+
+    job.status = "completed";
+  } catch (error: any) {
+    job.error = {
+      message: error?.message || String(error),
+      details: error?.response?.data
+        ? JSON.stringify(error.response.data)
+        : undefined,
+    };
+    job.status = "failed";
+    console.error("❌ Translation job failed:", job.error.message);
+  } finally {
+    job.updatedAt = Date.now();
+  }
+}
 
 const server = createServer(async (req, res) => {
   console.log(
@@ -25,6 +234,116 @@ const server = createServer(async (req, res) => {
     console.log("✅ Responding to preflight request");
     res.writeHead(200);
     res.end();
+    return;
+  }
+
+  // Handle POST to /speech (text-to-speech synthesis)
+  if (req.method === "POST" && req.url === "/speech") {
+    console.log("🎤 Processing speech synthesis request...");
+
+    const relaySecretHeader = req.headers["x-relay-secret"];
+    const providedSecret = Array.isArray(relaySecretHeader)
+      ? relaySecretHeader[0]
+      : relaySecretHeader;
+    const expectedSecret = process.env.RELAY_SECRET;
+    if (
+      !providedSecret ||
+      !expectedSecret ||
+      providedSecret !== expectedSecret
+    ) {
+      console.log("❌ Invalid or missing relay secret for /speech");
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      return;
+    }
+
+    const openaiKeyHeader = req.headers["x-openai-key"];
+    const openaiKey = Array.isArray(openaiKeyHeader)
+      ? openaiKeyHeader[0]
+      : openaiKeyHeader;
+    if (!openaiKey) {
+      console.log("❌ Missing OpenAI API key for /speech");
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
+      return;
+    }
+
+    try {
+      let body = "";
+      req.on("data", (chunk) => {
+        body += chunk.toString();
+      });
+
+      req.on("end", async () => {
+        try {
+          const parsed = JSON.parse(body || "{}");
+          const text = parsed.text;
+          if (!text || typeof text !== "string") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ error: "Invalid request: text is required" })
+            );
+            return;
+          }
+
+          const voice = parsed.voice || "alloy";
+          const model = parsed.model || "tts-1";
+          const format = parsed.format || "mp3";
+          const responseFormat = parsed.response_format;
+
+          console.log(
+            `🎶 Generating speech (${text.length} chars) model=${model} voice=${voice} format=${format}`
+          );
+
+          const client = makeOpenAI(openaiKey);
+          const speech = await client.audio.speech.create({
+            model,
+            voice,
+            input: text,
+            ...(responseFormat || format
+              ? { response_format: responseFormat || format }
+              : {}),
+          });
+
+          const arrayBuffer = await speech.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+          const audioBase64 = buffer.toString("base64");
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              audioBase64,
+              voice,
+              model,
+              format,
+              length: text.length,
+            })
+          );
+        } catch (error: any) {
+          console.error(
+            "❌ Relay speech synthesis error:",
+            error.message || error
+          );
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Speech synthesis failed",
+              details: error?.message || String(error),
+            })
+          );
+        }
+      });
+    } catch (error: any) {
+      console.error("❌ Relay speech handler error:", error.message || error);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "Speech synthesis failed",
+          details: error?.message || String(error),
+        })
+      );
+    }
+
     return;
   }
 
@@ -109,7 +428,7 @@ const server = createServer(async (req, res) => {
       const fs = await import("fs");
       const fileBuffer = await fs.promises.readFile(file.filepath);
       const fileBlob = new File(
-        [fileBuffer],
+        [fileBuffer as unknown as BlobPart],
         file.originalFilename || "audio.webm",
         {
           type: file.mimetype || "audio/webm",
@@ -146,13 +465,10 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Handle POST to /translate (supports two modes):
-  // 1) Simple text translation: { text, target_language, model, temperature }
-  // 2) Chat style translation: { messages, model, temperature } (OpenAI chat.completions compatible)
+  // Handle POST to /translate via async job submission
   if (req.method === "POST" && req.url === "/translate") {
-    console.log("🌐 Processing translate request...");
+    console.log("🌐 Processing translate request (job)...");
 
-    // Validate relay secret
     const relaySecretHeader = req.headers["x-relay-secret"];
     const providedSecret = Array.isArray(relaySecretHeader)
       ? relaySecretHeader[0]
@@ -169,141 +485,405 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Get OpenAI API key from headers
-    const openaiKey = req.headers["x-openai-key"] as string;
+    const openaiKeyHeader = req.headers["x-openai-key"];
+    const openaiKey = Array.isArray(openaiKeyHeader)
+      ? openaiKeyHeader[0]
+      : openaiKeyHeader;
     if (!openaiKey) {
-      console.log("❌ Missing OpenAI API key");
+      console.log("❌ Missing OpenAI API key for /translate");
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
       return;
     }
 
-    console.log(
-      "🎯 Relay secret and OpenAI key validated, processing translation..."
-    );
-
     try {
-      // Parse JSON body
-      let body = "";
-      req.on("data", (chunk) => {
-        body += chunk.toString();
-      });
+      const parsed = await readJsonBody(req);
 
-      req.on("end", async () => {
-        try {
-          const parsed = JSON.parse(body);
-          const openai = makeOpenAI(openaiKey);
+      let payload: ChatJobPayload | TextJobPayload | null = null;
+      if (Array.isArray(parsed?.messages)) {
+        const messages = parsed.messages.map((m: any) => ({
+          role: String(m?.role ?? ""),
+          content: String(m?.content ?? ""),
+        }));
+        const model =
+          typeof parsed?.model === "string" && parsed.model.trim()
+            ? parsed.model.trim()
+            : DEFAULT_TRANSLATION_MODEL;
+        payload = {
+          mode: "chat",
+          messages,
+          model,
+          temperature: parsed?.temperature,
+          reasoning: parsed?.reasoning,
+        };
+      } else if (
+        typeof parsed?.text === "string" &&
+        parsed.text.trim() &&
+        typeof parsed?.target_language === "string" &&
+        parsed.target_language.trim()
+      ) {
+        const model =
+          typeof parsed?.model === "string" && parsed.model.trim()
+            ? parsed.model.trim()
+            : DEFAULT_TRANSLATION_MODEL;
+        payload = {
+          mode: "text",
+          text: parsed.text,
+          target_language: parsed.target_language,
+          model,
+          temperature: parsed?.temperature,
+        };
+      }
 
-          // Branch: chat-style translation passthrough
-          if (Array.isArray(parsed?.messages)) {
-            const { messages, model, temperature, reasoning } = parsed as any;
-            const isGpt5 = String(model || DEFAULT_TRANSLATION_MODEL).startsWith("gpt-5");
+      if (!payload) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: "Invalid translation payload",
+            details: "Expected messages[] or text/target_language",
+          })
+        );
+        return;
+      }
 
-            let completion;
-            try {
-              const req: any = {
-                model: model || DEFAULT_TRANSLATION_MODEL,
-                messages,
-                ...(reasoning ? { reasoning } : {}),
-              };
-              if (!isGpt5 && typeof temperature === "number") {
-                req.temperature = temperature;
-              }
-              completion = await openai.chat.completions.create(req);
-            } catch (err: any) {
-              const status = err?.status || err?.response?.status;
-              const msg = String(err?.message || "").toLowerCase();
-              if (reasoning && (status === 400 || msg.includes("reasoning"))) {
-                const req2: any = {
-                  model: model || DEFAULT_TRANSLATION_MODEL,
-                  messages,
-                };
-                if (!isGpt5 && typeof temperature === "number") {
-                  req2.temperature = temperature;
-                }
-                completion = await openai.chat.completions.create(req2);
-              } else {
-                throw err;
-              }
-            }
+      pruneTranslationJobs();
 
-            console.log("🎯 Relay chat translation completed successfully!");
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(completion));
-            return;
-          }
+      const job: TranslationJob = {
+        id: randomUUID(),
+        status: "queued",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        payload,
+        openaiKey,
+      };
 
-          // Simple text translation mode
-          const { text, target_language, model, temperature } = parsed as any;
-          if (!text || !target_language) {
-            console.log("❌ Missing required fields: text or target_language");
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                error: "Missing required fields: text or target_language",
-              })
+      translationJobs.set(job.id, job);
+
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jobId: job.id, status: job.status }));
+
+      setImmediate(() => {
+        processTranslationJob(job)
+          .catch((err) => {
+            job.error = {
+              message: err?.message || String(err),
+            };
+            job.status = "failed";
+            job.updatedAt = Date.now();
+            console.error(
+              "❌ Translation job processing error:",
+              job.error.message
             );
-            return;
-          }
-
-          console.log(
-            `🌐 Translating to: ${target_language} with model: ${
-              model || DEFAULT_TRANSLATION_MODEL
-            }`
-          );
-
-          const completion = await openai.chat.completions.create({
-            model: model || DEFAULT_TRANSLATION_MODEL,
-            messages: [
-              {
-                role: "system",
-                content: `You are a professional translator. Translate the following text to ${target_language}. Only return the translated text, nothing else.`,
-              },
-              {
-                role: "user",
-                content: text,
-              },
-            ],
-            temperature: typeof temperature === "number" ? temperature : 0.3,
+          })
+          .finally(() => {
+            pruneTranslationJobs();
           });
-
-          const translatedText = completion.choices[0]?.message?.content || "";
-
-          console.log("🎯 Relay translation completed successfully!");
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              translated_text: translatedText,
-              target_language: target_language,
-              model: model || DEFAULT_TRANSLATION_MODEL,
-            })
-          );
-        } catch (parseError: any) {
-          console.error(
-            "❌ Relay translation parse error:",
-            parseError.message
-          );
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "Translation failed",
-              details: parseError.message,
-            })
-          );
-        }
       });
     } catch (error: any) {
-      console.error("❌ Relay translation error:", error.message);
+      console.error(
+        "❌ Relay translation job submission error:",
+        error.message
+      );
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          error: "Translation failed",
+          error: "Translation job submission failed",
           details: error.message,
         })
       );
     }
 
     return;
+  }
+  if (
+    req.method === "GET" &&
+    req.url &&
+    req.url.startsWith("/translate/result/")
+  ) {
+    const relaySecretHeader = req.headers["x-relay-secret"];
+    const providedSecret = Array.isArray(relaySecretHeader)
+      ? relaySecretHeader[0]
+      : relaySecretHeader;
+    const expectedSecret = process.env.RELAY_SECRET;
+    if (
+      !providedSecret ||
+      !expectedSecret ||
+      providedSecret !== expectedSecret
+    ) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      return;
+    }
+
+    const jobId = decodeURIComponent(
+      req.url.split("?")[0].split("/").pop() || ""
+    );
+    const job = translationJobs.get(jobId);
+    if (!job) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Job not found" }));
+      return;
+    }
+
+    if (job.status === "completed") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(job.result ?? {}));
+    } else if (job.status === "failed") {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: job.error?.message || "Translation failed",
+          details: job.error?.details,
+        })
+      );
+    } else {
+      res.writeHead(202, {
+        "Content-Type": "application/json",
+        "Retry-After": "2",
+      });
+      res.end(JSON.stringify({ status: job.status }));
+    }
+    return;
+  }
+  // Handle POST to /dub (multi-chunk speech synthesis)
+  if (req.method === "POST" && req.url === "/dub") {
+    console.log("🎬 Processing dub synthesis request...");
+
+    const relaySecretHeader = req.headers["x-relay-secret"];
+    const providedSecret = Array.isArray(relaySecretHeader)
+      ? relaySecretHeader[0]
+      : relaySecretHeader;
+    const expectedSecret = process.env.RELAY_SECRET;
+    if (
+      !providedSecret ||
+      !expectedSecret ||
+      providedSecret !== expectedSecret
+    ) {
+      console.log("❌ Invalid or missing relay secret for /dub");
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      return;
+    }
+
+    const openaiKeyHeader = req.headers["x-openai-key"];
+    const openaiKey = Array.isArray(openaiKeyHeader)
+      ? openaiKeyHeader[0]
+      : openaiKeyHeader;
+    if (!openaiKey) {
+      console.log("❌ Missing OpenAI API key for /dub");
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
+      return;
+    }
+
+    try {
+      const parsed = await readJsonBody(req);
+      const segmentsPayload = Array.isArray(parsed?.segments)
+        ? parsed.segments
+            .map((segment: any, idx: number) => {
+              const rawText =
+                typeof segment?.text === "string" ? segment.text : "";
+              const text = rawText.trim();
+              if (!text) {
+                return null;
+              }
+              const index = Number.isFinite(segment?.index)
+                ? Number(segment.index)
+                : idx + 1;
+              const start =
+                typeof segment?.start === "number" &&
+                Number.isFinite(segment.start)
+                  ? segment.start
+                  : undefined;
+              const end =
+                typeof segment?.end === "number" && Number.isFinite(segment.end)
+                  ? segment.end
+                  : undefined;
+              const targetDuration =
+                typeof segment?.targetDuration === "number" &&
+                Number.isFinite(segment.targetDuration)
+                  ? segment.targetDuration
+                  : typeof start === "number" && typeof end === "number"
+                  ? Math.max(0, end - start)
+                  : undefined;
+              return {
+                index,
+                text,
+                start,
+                end,
+                targetDuration,
+              };
+            })
+            .filter(
+              (
+                seg: any
+              ): seg is {
+                index: number;
+                text: string;
+                start?: number;
+                end?: number;
+                targetDuration?: number;
+              } => Boolean(seg)
+            )
+        : [];
+
+      const lines = Array.isArray(parsed?.lines)
+        ? parsed.lines.map((line: any) => String(line ?? "").trim())
+        : [];
+      const voice =
+        typeof parsed?.voice === "string" && parsed.voice.trim()
+          ? parsed.voice.trim()
+          : "alloy";
+      const model =
+        typeof parsed?.model === "string" && parsed.model.trim()
+          ? parsed.model.trim()
+          : "tts-1";
+      const format =
+        typeof parsed?.format === "string" && parsed.format.trim()
+          ? parsed.format.trim()
+          : "mp3";
+
+      const client = makeOpenAI(openaiKey);
+
+      if (segmentsPayload.length > 0) {
+        const totalCharacters = segmentsPayload.reduce(
+          (sum: number, seg: { text: string }) => sum + seg.text.length,
+          0
+        );
+
+        console.log(
+          `🎧 Synthesizing ${segmentsPayload.length} segment(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`
+        );
+
+        const segmentResponses: Array<{
+          index: number;
+          audioBase64: string;
+          targetDuration?: number;
+        }> = [];
+
+        for (let segIdx = 0; segIdx < segmentsPayload.length; segIdx++) {
+          const seg = segmentsPayload[segIdx];
+          console.log(
+            `   • Segment ${segIdx + 1}/${segmentsPayload.length} (index=${
+              seg.index
+            }, ${seg.text.length} chars)`
+          );
+
+          try {
+            const speech = await client.audio.speech.create({
+              model,
+              voice,
+              input: seg.text,
+              response_format: format,
+            });
+            const arrayBuffer = await speech.arrayBuffer();
+            segmentResponses.push({
+              index: seg.index,
+              audioBase64: Buffer.from(arrayBuffer).toString("base64"),
+              targetDuration: seg.targetDuration,
+            });
+            console.log(
+              `     · Completed ${segIdx + 1}/${segmentsPayload.length}`
+            );
+          } catch (segmentError: any) {
+            const details = segmentError?.response?.data ?? segmentError?.message;
+            console.error(
+              `❌ Relay segment ${segIdx + 1}/$${segmentsPayload.length} failed:`,
+              details
+            );
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                error: 'Dub synthesis failed',
+                details,
+                failedSegment: segIdx + 1,
+              })
+            );
+            return;
+          }
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            voice,
+            model,
+            format,
+            segmentCount: segmentResponses.length,
+            totalCharacters,
+            segments: segmentResponses,
+          })
+        );
+        return;
+      }
+
+      if (!lines.length) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ error: "Invalid request: lines array required" })
+        );
+        return;
+      }
+
+      const totalCharacters = lines.reduce(
+        (sum: number, line: string) => sum + line.length,
+        0
+      );
+      const chunks = chunkLines(lines, MAX_TTS_CHARS_PER_CHUNK);
+
+      if (!chunks.length) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No valid dialogue for dubbing" }));
+        return;
+      }
+
+      console.log(
+        `🎧 Synthesizing ${chunks.length} chunk(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`
+      );
+
+      const chunkBuffers: Buffer[] = [];
+
+      for (let idx = 0; idx < chunks.length; idx++) {
+        const chunk = chunks[idx];
+        console.log(
+          `   • Chunk ${idx + 1}/${chunks.length} (${chunk.length} chars)`
+        );
+        const speech = await client.audio.speech.create({
+          model,
+          voice,
+          input: chunk,
+          response_format: format,
+        });
+        const arrayBuffer = await speech.arrayBuffer();
+        chunkBuffers.push(Buffer.from(arrayBuffer));
+      }
+
+      const combined = Buffer.concat(chunkBuffers);
+      const audioBase64 = combined.toString("base64");
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          audioBase64,
+          voice,
+          model,
+          format,
+          chunkCount: chunks.length,
+          totalCharacters,
+        })
+      );
+      return;
+    } catch (error: any) {
+      console.error("❌ Relay dub synthesis error:", error?.message || error);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "Dub synthesis failed",
+          details: error?.message || String(error),
+        })
+      );
+      return;
+    }
   }
 
   // Handle all other requests
@@ -316,3 +896,5 @@ server.listen(PORT, () => {
   console.log(`🚀 OpenAI Relay server running on port ${PORT}`);
   console.log(`📡 Ready to process real transcriptions via OpenAI`);
 });
+
+setInterval(() => pruneTranslationJobs(), 60_000);
