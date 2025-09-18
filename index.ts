@@ -8,6 +8,30 @@ import { DEFAULT_TRANSLATION_MODEL } from "./constants.js";
 const PORT = process.env.PORT || 3000;
 
 const MAX_TTS_CHARS_PER_CHUNK = 3_500;
+const DUB_MAX_CONCURRENCY = Math.max(
+  1,
+  Number.parseInt(process.env.DUB_MAX_CONCURRENCY || "4", 10)
+);
+const DUB_MAX_RETRIES = Math.max(
+  1,
+  Number.parseInt(process.env.DUB_MAX_RETRIES || "3", 10)
+);
+const DUB_RETRY_BASE_DELAY_MS = Math.max(
+  100,
+  Number.parseInt(process.env.DUB_RETRY_BASE_DELAY_MS || "500", 10)
+);
+const DUB_RETRY_MAX_DELAY_MS = Math.max(
+  DUB_RETRY_BASE_DELAY_MS,
+  Number.parseInt(process.env.DUB_RETRY_MAX_DELAY_MS || "4000", 10)
+);
+const DUB_MAX_TOTAL_CHARACTERS = Math.max(
+  1,
+  Number.parseInt(process.env.DUB_MAX_TOTAL_CHARACTERS || "90000", 10)
+);
+const DUB_MAX_SEGMENTS = Math.max(
+  1,
+  Number.parseInt(process.env.DUB_MAX_SEGMENTS || "240", 10)
+);
 
 type TranslationJobStatus = "queued" | "processing" | "completed" | "failed";
 
@@ -112,6 +136,69 @@ function pruneTranslationJobs(maxAgeMs = 1000 * 60 * 60) {
       translationJobs.delete(jobId);
     }
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function extractStatus(error: any): number | null {
+  const direct = error?.status ?? error?.response?.status ?? error?.cause?.status;
+  if (typeof direct === "number" && Number.isFinite(direct)) {
+    return direct;
+  }
+
+  if (typeof direct === "string" && direct.trim()) {
+    const parsed = Number.parseInt(direct, 10);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  if (typeof error?.message === "string") {
+    const match = error.message.match(/\b(\d{3})\b/);
+    if (match) {
+      const parsed = Number.parseInt(match[1], 10);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  return null;
+}
+
+function shouldRetrySegmentError(error: any): boolean {
+  const status = extractStatus(error);
+  if (status != null) {
+    if (status >= 200 && status < 400) {
+      return false;
+    }
+    if ([408, 409, 425, 429, 500, 502, 503, 504, 522, 524].includes(status)) {
+      return true;
+    }
+  }
+
+  const message = String(error?.message || "").toLowerCase();
+  if (
+    /timeout|temporarily unavailable|connection reset|gateway|rate limit/.test(
+      message
+    )
+  ) {
+    return true;
+  }
+
+  const code = typeof error?.code === "string" ? error.code.toUpperCase() : null;
+  if (
+    code &&
+    ["ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ECONNABORTED"].includes(
+      code
+    )
+  ) {
+    return true;
+  }
+
+  return status == null;
 }
 
 async function processTranslationJob(job: TranslationJob): Promise<void> {
@@ -746,10 +833,32 @@ const server = createServer(async (req, res) => {
       const client = makeOpenAI(openaiKey);
 
       if (segmentsPayload.length > 0) {
+        if (segmentsPayload.length > DUB_MAX_SEGMENTS) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Dub request too large",
+              details: `Received ${segmentsPayload.length} segments, limit is ${DUB_MAX_SEGMENTS}`,
+            })
+          );
+          return;
+        }
+
         const totalCharacters = segmentsPayload.reduce(
           (sum: number, seg: { text: string }) => sum + seg.text.length,
           0
         );
+
+        if (totalCharacters > DUB_MAX_TOTAL_CHARACTERS) {
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Dub request too large",
+              details: `Received ${totalCharacters} characters, limit is ${DUB_MAX_TOTAL_CHARACTERS}`,
+            })
+          );
+          return;
+        }
 
         console.log(
           `🎧 Synthesizing ${segmentsPayload.length} segment(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`
@@ -759,49 +868,131 @@ const server = createServer(async (req, res) => {
           index: number;
           audioBase64: string;
           targetDuration?: number;
-        }> = [];
+        }> = new Array(segmentsPayload.length);
 
-        for (let segIdx = 0; segIdx < segmentsPayload.length; segIdx++) {
+        let requestClosed = false;
+        const segmentAbortControllers = new Map<number, AbortController>();
+
+        req.on("close", () => {
+          requestClosed = true;
+          for (const controller of segmentAbortControllers.values()) {
+            controller.abort();
+          }
+        });
+
+        const synthesizeSegment = async (segIdx: number) => {
           const seg = segmentsPayload[segIdx];
-          console.log(
-            `   • Segment ${segIdx + 1}/${segmentsPayload.length} (index=${
-              seg.index
-            }, ${seg.text.length} chars)`
-          );
+          let attempt = 0;
+          const abortController = new AbortController();
+          segmentAbortControllers.set(segIdx, abortController);
 
           try {
-            const speech = await client.audio.speech.create({
-              model,
-              voice,
-              input: seg.text,
-              response_format: format,
-            });
-            const arrayBuffer = await speech.arrayBuffer();
-            segmentResponses.push({
-              index: seg.index,
-              audioBase64: Buffer.from(arrayBuffer).toString("base64"),
-              targetDuration: seg.targetDuration,
-            });
+            while (true) {
+              if (requestClosed) {
+                throw new Error("Client disconnected");
+              }
+
+              attempt += 1;
+              try {
+                const speech = await client.audio.speech.create(
+                  {
+                    model,
+                    voice,
+                    input: seg.text,
+                    response_format: format,
+                  },
+                  { signal: abortController.signal }
+                );
+                const arrayBuffer = await speech.arrayBuffer();
+                segmentResponses[segIdx] = {
+                  index: seg.index,
+                  audioBase64: Buffer.from(arrayBuffer).toString("base64"),
+                  targetDuration: seg.targetDuration,
+                };
+                return;
+              } catch (segmentError: any) {
+                if (requestClosed || abortController.signal.aborted) {
+                  throw segmentError;
+                }
+
+                if (
+                  attempt >= DUB_MAX_RETRIES ||
+                  !shouldRetrySegmentError(segmentError)
+                ) {
+                  throw segmentError;
+                }
+
+                const delay = Math.min(
+                  DUB_RETRY_MAX_DELAY_MS,
+                  DUB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+                );
+                console.warn(
+                  `⚠️ Segment ${segIdx + 1}/${segmentsPayload.length} retry ${attempt}/${DUB_MAX_RETRIES} in ${delay}ms:`,
+                  segmentError?.message || segmentError
+                );
+                await sleep(delay);
+              }
+            }
+          } finally {
+            segmentAbortControllers.delete(segIdx);
+          }
+        };
+
+        let nextIndex = 0;
+        const workerCount = Math.min(DUB_MAX_CONCURRENCY, segmentsPayload.length);
+
+        const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
+          while (true) {
+            if (requestClosed) {
+              return;
+            }
+
+            const current = nextIndex++;
+            if (current >= segmentsPayload.length) {
+              return;
+            }
+
+            const seg = segmentsPayload[current];
             console.log(
-              `     · Completed ${segIdx + 1}/${segmentsPayload.length}`
+              `   • Worker ${workerIdx + 1}/${workerCount} segment ${current + 1}/${segmentsPayload.length} (index=${seg.index}, ${seg.text.length} chars)`
             );
-          } catch (segmentError: any) {
-            const details = segmentError?.response?.data ?? segmentError?.message;
-            console.error(
-              `❌ Relay segment ${segIdx + 1}/$${segmentsPayload.length} failed:`,
-              details
+            await synthesizeSegment(current);
+            console.log(
+              `     · Completed segment ${current + 1}/${segmentsPayload.length}`
             );
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(
-              JSON.stringify({
-                error: 'Dub synthesis failed',
-                details,
-                failedSegment: segIdx + 1,
-              })
+          }
+        });
+
+        try {
+          await Promise.all(workers);
+        } catch (segmentError: any) {
+          if (requestClosed) {
+            console.warn(
+              "⚠️ Dub request aborted by upstream client while synthesizing segments"
             );
             return;
           }
+
+          const details = segmentError?.response?.data ?? segmentError?.message;
+          console.error("❌ Relay segment synthesis failed:", details);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "Dub synthesis failed",
+              details,
+            })
+          );
+          return;
         }
+
+        if (requestClosed) {
+          console.warn(
+            "⚠️ Dub request closed before completion; skipping response"
+          );
+          return;
+        }
+
+        const completedSegments = segmentResponses.filter(Boolean);
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
@@ -809,9 +1000,9 @@ const server = createServer(async (req, res) => {
             voice,
             model,
             format,
-            segmentCount: segmentResponses.length,
+            segmentCount: completedSegments.length,
             totalCharacters,
-            segments: segmentResponses,
+            segments: completedSegments,
           })
         );
         return;
