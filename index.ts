@@ -39,7 +39,6 @@ type ChatJobPayload = {
   mode: "chat";
   messages: Array<{ role: string; content: string }>;
   model: string;
-  temperature?: number;
   reasoning?: any;
 };
 
@@ -48,7 +47,6 @@ type TextJobPayload = {
   text: string;
   target_language: string;
   model: string;
-  temperature?: number;
 };
 
 type TranslationJob = {
@@ -139,11 +137,12 @@ function pruneTranslationJobs(maxAgeMs = 1000 * 60 * 60) {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function extractStatus(error: any): number | null {
-  const direct = error?.status ?? error?.response?.status ?? error?.cause?.status;
+  const direct =
+    error?.status ?? error?.response?.status ?? error?.cause?.status;
   if (typeof direct === "number" && Number.isFinite(direct)) {
     return direct;
   }
@@ -188,12 +187,17 @@ function shouldRetrySegmentError(error: any): boolean {
     return true;
   }
 
-  const code = typeof error?.code === "string" ? error.code.toUpperCase() : null;
+  const code =
+    typeof error?.code === "string" ? error.code.toUpperCase() : null;
   if (
     code &&
-    ["ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "ECONNABORTED"].includes(
-      code
-    )
+    [
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "EHOSTUNREACH",
+      "ENETUNREACH",
+      "ECONNABORTED",
+    ].includes(code)
   ) {
     return true;
   }
@@ -209,10 +213,9 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
     const client = makeOpenAI(job.openaiKey);
     const payload = job.payload;
     const model = payload.model || DEFAULT_TRANSLATION_MODEL;
-    const isGpt5 = String(model).startsWith("gpt-5");
 
     if (payload.mode === "chat") {
-      const { messages, temperature, reasoning } = payload;
+      const { messages, reasoning } = payload;
 
       const request: any = {
         model,
@@ -221,14 +224,6 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
 
       if (reasoning !== undefined) {
         request.reasoning = reasoning;
-      }
-
-      if (
-        !isGpt5 &&
-        typeof temperature === "number" &&
-        Number.isFinite(temperature)
-      ) {
-        request.temperature = temperature;
       }
 
       let completion;
@@ -241,13 +236,6 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
         const msg = String(maybeReasoningError?.message || "").toLowerCase();
         if (reasoning && (status === 400 || msg.includes("reasoning"))) {
           const reqWithoutReasoning: any = { model, messages };
-          if (
-            !isGpt5 &&
-            typeof temperature === "number" &&
-            Number.isFinite(temperature)
-          ) {
-            reqWithoutReasoning.temperature = temperature;
-          }
           completion = await client.chat.completions.create(
             reqWithoutReasoning
           );
@@ -258,7 +246,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
 
       job.result = completion;
     } else {
-      const { text, target_language, temperature } = payload;
+      const { text, target_language } = payload;
 
       const request: any = {
         model,
@@ -273,14 +261,6 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
           },
         ],
       };
-
-      if (
-        !isGpt5 &&
-        typeof temperature === "number" &&
-        Number.isFinite(temperature)
-      ) {
-        request.temperature = temperature;
-      }
 
       const completion = await client.chat.completions.create(request);
       job.result = completion;
@@ -600,7 +580,6 @@ const server = createServer(async (req, res) => {
           mode: "chat",
           messages,
           model,
-          temperature: parsed?.temperature,
           reasoning: parsed?.reasoning,
         };
       } else if (
@@ -618,7 +597,6 @@ const server = createServer(async (req, res) => {
           text: parsed.text,
           target_language: parsed.target_language,
           model,
-          temperature: parsed?.temperature,
         };
       }
 
@@ -927,7 +905,9 @@ const server = createServer(async (req, res) => {
                   DUB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
                 );
                 console.warn(
-                  `⚠️ Segment ${segIdx + 1}/${segmentsPayload.length} retry ${attempt}/${DUB_MAX_RETRIES} in ${delay}ms:`,
+                  `⚠️ Segment ${segIdx + 1}/${
+                    segmentsPayload.length
+                  } retry ${attempt}/${DUB_MAX_RETRIES} in ${delay}ms:`,
                   segmentError?.message || segmentError
                 );
                 await sleep(delay);
@@ -939,29 +919,41 @@ const server = createServer(async (req, res) => {
         };
 
         let nextIndex = 0;
-        const workerCount = Math.min(DUB_MAX_CONCURRENCY, segmentsPayload.length);
+        const workerCount = Math.min(
+          DUB_MAX_CONCURRENCY,
+          segmentsPayload.length
+        );
 
-        const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
-          while (true) {
-            if (requestClosed) {
-              return;
+        const workers = Array.from(
+          { length: workerCount },
+          async (_, workerIdx) => {
+            while (true) {
+              if (requestClosed) {
+                return;
+              }
+
+              const current = nextIndex++;
+              if (current >= segmentsPayload.length) {
+                return;
+              }
+
+              const seg = segmentsPayload[current];
+              console.log(
+                `   • Worker ${workerIdx + 1}/${workerCount} segment ${
+                  current + 1
+                }/${segmentsPayload.length} (index=${seg.index}, ${
+                  seg.text.length
+                } chars)`
+              );
+              await synthesizeSegment(current);
+              console.log(
+                `     · Completed segment ${current + 1}/${
+                  segmentsPayload.length
+                }`
+              );
             }
-
-            const current = nextIndex++;
-            if (current >= segmentsPayload.length) {
-              return;
-            }
-
-            const seg = segmentsPayload[current];
-            console.log(
-              `   • Worker ${workerIdx + 1}/${workerCount} segment ${current + 1}/${segmentsPayload.length} (index=${seg.index}, ${seg.text.length} chars)`
-            );
-            await synthesizeSegment(current);
-            console.log(
-              `     · Completed segment ${current + 1}/${segmentsPayload.length}`
-            );
           }
-        });
+        );
 
         try {
           await Promise.all(workers);

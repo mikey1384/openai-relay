@@ -15,10 +15,12 @@ A robust proxy service for OpenAI API that enables access from regions where Ope
 ## 🚀 Local Development
 
 ### Prerequisites
-- Node.js 18+ 
+
+- Node.js 18+
 - OpenAI API key
 
 ### Setup
+
 ```bash
 npm install
 export OPENAI_API_KEY=sk-your-key-here
@@ -28,12 +30,13 @@ npm run dev
 The server will start on `http://localhost:3000` with hot reload.
 
 ### Test Endpoints
+
 ```bash
 # Test translation endpoint
 curl -X POST http://localhost:3000/translate \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4.1",
+    "model": "gpt-5.1",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 
@@ -46,6 +49,7 @@ curl -X POST http://localhost:3000/transcribe \
 ## 🌩️ Fly.io Deployment
 
 ### Initial Setup
+
 ```bash
 # Install flyctl CLI
 curl -L https://fly.io/install.sh | sh
@@ -56,11 +60,13 @@ flyctl launch --name translator-relay --region sin
 ```
 
 ### Set Environment Variables
+
 ```bash
 flyctl secrets set OPENAI_API_KEY=sk-your-openai-key-here
 ```
 
 ### Deploy
+
 ```bash
 flyctl deploy
 ```
@@ -68,6 +74,7 @@ flyctl deploy
 Your relay will be available at `https://translator-relay.fly.dev`
 
 ### Monitor
+
 ```bash
 # View logs
 flyctl logs
@@ -82,31 +89,34 @@ flyctl scale count 2
 ## 📡 API Endpoints
 
 ### POST /transcribe
+
 Proxy to OpenAI's audio transcription API.
 
 **Headers:**
+
 - `Content-Type: multipart/form-data`
 
 **Body:**
+
 - `file`: Audio file (mp3, wav, etc.)
 - `model`: Model name (default: whisper-1)
 - `language`: Optional language code
 - `prompt`: Optional context prompt
 
-### POST /translate  
+### POST /translate
+
 Proxy to OpenAI's chat completions API.
 
 **Headers:**
+
 - `Content-Type: application/json`
 
 **Body:**
+
 ```json
 {
-  "model": "gpt-4.1",
-  "messages": [
-    {"role": "user", "content": "Text to translate"}
-  ],
-  "temperature": 0.4
+  "model": "gpt-5.1",
+  "messages": [{ "role": "user", "content": "Text to translate" }]
 }
 ```
 
@@ -118,7 +128,7 @@ Update your `stage5-api` Cloudflare Worker to use the relay:
 // In stage5-api OpenAI client setup
 const openai = new OpenAI({
   apiKey: env.OPENAI_API_KEY,
-  baseURL: 'https://translator-relay.fly.dev', // Your relay URL
+  baseURL: "https://translator-relay.fly.dev", // Your relay URL
   timeout: 60_000,
   maxRetries: 3,
 });
@@ -129,13 +139,14 @@ const transcription = await openai.audio.transcriptions.create({
 }); // Will call https://translator-relay.fly.dev/transcribe
 
 const completion = await openai.chat.completions.create({
-  // ... same parameters  
+  // ... same parameters
 }); // Will call https://translator-relay.fly.dev/translate
 ```
 
 ## 🛡️ Security Considerations
 
 ### Production Hardening
+
 1. **Restrict CORS**: Update `Access-Control-Allow-Origin` to specific domains
 2. **Rate Limiting**: Add rate limiting middleware
 3. **Request Validation**: Add stricter input validation
@@ -143,16 +154,14 @@ const completion = await openai.chat.completions.create({
 5. **Secrets Management**: Use Fly.io secrets for sensitive data
 
 ### Example Production CORS
+
 ```javascript
 // Replace in index.js for production
-const allowedOrigins = [
-  'https://yourdomain.com',
-  'https://api.yourdomain.com'
-];
+const allowedOrigins = ["https://yourdomain.com", "https://api.yourdomain.com"];
 
 const origin = req.headers.origin;
 if (allowedOrigins.includes(origin)) {
-  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader("Access-Control-Allow-Origin", origin);
 }
 ```
 
@@ -161,20 +170,24 @@ if (allowedOrigins.includes(origin)) {
 ### Common Issues
 
 **Server not starting:**
+
 - Check Node.js version (18+ required)
 - Verify `OPENAI_API_KEY` environment variable
 
 **Fly.io deployment fails:**
+
 - Ensure you're logged into flyctl
 - Check app name availability
 - Verify region supports your plan
 
 **Requests timing out:**
+
 - Check OpenAI API key permissions
 - Verify network connectivity from deployment region
 - Check Fly.io app logs: `flyctl logs`
 
 **Cancellation not working:**
+
 - Ensure client is properly sending abort signals
 - Check network connectivity
 - Verify error handling in client code
@@ -182,10 +195,10 @@ if (allowedOrigins.includes(origin)) {
 ## 📊 Architecture
 
 ```
-Client (Electron App) 
+Client (Electron App)
     ↓ AbortSignal
 stage5-api (Cloudflare Worker)
-    ↓ HTTP Request with AbortSignal  
+    ↓ HTTP Request with AbortSignal
 OpenAI Relay (Fly.io - Singapore)
     ↓ Proxied Request with AbortSignal
 OpenAI API (Allowed Region)
@@ -200,4 +213,4 @@ OpenAI API (Allowed Region)
 
 ## 📄 License
 
-ISC License - see LICENSE file for details 
+ISC License - see LICENSE file for details
