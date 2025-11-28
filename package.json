@@ -19,8 +19,8 @@
   "author": "Mikey Lee",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
     "formidable": "^3.5.4",
-    "groq-sdk": "^0.30.0",
     "openai": "^5.5.1"
   },
   "devDependencies": {

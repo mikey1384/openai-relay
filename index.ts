@@ -2,8 +2,9 @@ import { createServer } from "node:http";
 import { Buffer } from "node:buffer";
 import { IncomingForm } from "formidable";
 import { randomUUID } from "node:crypto";
-import { makeOpenAI, makeGroq } from "./openai-config.js";
-import { DEFAULT_TRANSLATION_MODEL } from "./constants.js";
+import { makeOpenAI } from "./openai-config.js";
+import { translateWithClaude } from "./anthropic-config.js";
+import { DEFAULT_TRANSLATION_MODEL, isClaudeModel } from "./constants.js";
 
 const PORT = process.env.PORT || 3000;
 
@@ -32,6 +33,7 @@ const DUB_MAX_SEGMENTS = Math.max(
   1,
   Number.parseInt(process.env.DUB_MAX_SEGMENTS || "240", 10)
 );
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB limit for request bodies
 
 type TranslationJobStatus = "queued" | "processing" | "completed" | "failed";
 
@@ -56,6 +58,7 @@ type TranslationJob = {
   updatedAt: number;
   payload: ChatJobPayload | TextJobPayload;
   openaiKey: string;
+  anthropicKey?: string;
   result?: any;
   error?: { message: string; details?: string };
 };
@@ -65,7 +68,14 @@ const translationJobs = new Map<string, TranslationJob>();
 function readJsonBody(req: any): Promise<any> {
   return new Promise((resolve, reject) => {
     let body = "";
+    let bodySize = 0;
     req.on("data", (chunk: Buffer) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY_SIZE) {
+        req.destroy();
+        reject(new Error("Request body too large"));
+        return;
+      }
       body += chunk.toString();
     });
     req.on("end", () => {
@@ -210,9 +220,47 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
   job.updatedAt = Date.now();
 
   try {
-    const client = makeOpenAI(job.openaiKey);
     const payload = job.payload;
     const model = payload.model || DEFAULT_TRANSLATION_MODEL;
+
+    // Route to Claude for Claude models
+    if (isClaudeModel(model)) {
+      const anthropicKey =
+        job.anthropicKey || process.env.ANTHROPIC_API_KEY || "";
+      if (!anthropicKey) {
+        throw new Error("No Anthropic API key available for Claude model");
+      }
+
+      if (payload.mode === "chat") {
+        const { messages } = payload;
+        const completion = await translateWithClaude({
+          messages: messages as any,
+          model,
+          apiKey: anthropicKey,
+        });
+        job.result = completion;
+      } else {
+        const { text, target_language } = payload;
+        const completion = await translateWithClaude({
+          messages: [
+            {
+              role: "user",
+              content: `You are a professional translator. Translate the following text to ${target_language}. Only return the translated text, nothing else.\n\n${text}`,
+            },
+          ],
+          model,
+          apiKey: anthropicKey,
+        });
+        job.result = completion;
+      }
+
+      console.log(`🎯 Translation completed using Anthropic (model=${model})`);
+      job.status = "completed";
+      return;
+    }
+
+    // OpenAI path (existing logic)
+    const client = makeOpenAI(job.openaiKey);
 
     if (payload.mode === "chat") {
       const { messages, reasoning } = payload;
@@ -266,6 +314,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
       job.result = completion;
     }
 
+    console.log(`🎯 Translation completed using OpenAI (model=${model})`);
     job.status = "completed";
   } catch (error: any) {
     job.error = {
@@ -293,7 +342,7 @@ const server = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key, X-Groq-Key"
+    "Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key, X-Anthropic-Key"
   );
 
   // Handle preflight requests
@@ -337,11 +386,23 @@ const server = createServer(async (req, res) => {
 
     try {
       let body = "";
+      let bodySize = 0;
+      let rejected = false;
       req.on("data", (chunk) => {
+        if (rejected) return;
+        bodySize += chunk.length;
+        if (bodySize > MAX_BODY_SIZE) {
+          rejected = true;
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Request body too large" }));
+          req.destroy();
+          return;
+        }
         body += chunk.toString();
       });
 
       req.on("end", async () => {
+        if (rejected) return;
         try {
           const parsed = JSON.parse(body || "{}");
           const text = parsed.text;
@@ -464,32 +525,17 @@ const server = createServer(async (req, res) => {
         `🎵 Transcribing file: ${file.originalFilename} (${file.size} bytes) with model: ${model}`
       );
 
-      // Determine which key and client to use based on model
-      let client;
-      let usedProvider = "";
-      if (model === "whisper-large-v3" || model === "whisper-large-v3-turbo") {
-        const groqKey = req.headers["x-groq-key"] as string;
-        if (!groqKey) {
-          console.log("❌ Missing Groq API key for whisper-large-v3");
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Unauthorized - missing Groq key" }));
-          return;
-        }
-        client = makeGroq(groqKey);
-        usedProvider = "Groq";
-      } else {
-        const openaiKey = req.headers["x-openai-key"] as string;
-        if (!openaiKey) {
-          console.log("❌ Missing OpenAI API key");
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({ error: "Unauthorized - missing OpenAI key" })
-          );
-          return;
-        }
-        client = makeOpenAI(openaiKey);
-        usedProvider = "OpenAI";
+      // Only whisper-1 (OpenAI) is supported
+      const openaiKey = req.headers["x-openai-key"] as string;
+      if (!openaiKey) {
+        console.log("❌ Missing OpenAI API key");
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ error: "Unauthorized - missing OpenAI key" })
+        );
+        return;
       }
+      const client = makeOpenAI(openaiKey);
 
       // Read the file and create a proper File object
       const fs = await import("fs");
@@ -511,9 +557,7 @@ const server = createServer(async (req, res) => {
         timestamp_granularities: ["word", "segment"],
       });
 
-      console.log(
-        `🎯 Relay transcription completed successfully using ${usedProvider}!`
-      );
+      console.log(`🎯 Relay transcription completed successfully using OpenAI!`);
 
       // Send the real transcription result
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -556,12 +600,11 @@ const server = createServer(async (req, res) => {
     const openaiKey = Array.isArray(openaiKeyHeader)
       ? openaiKeyHeader[0]
       : openaiKeyHeader;
-    if (!openaiKey) {
-      console.log("❌ Missing OpenAI API key for /translate");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
-      return;
-    }
+
+    const anthropicKeyHeader = req.headers["x-anthropic-key"];
+    const anthropicKey = Array.isArray(anthropicKeyHeader)
+      ? anthropicKeyHeader[0]
+      : anthropicKeyHeader;
 
     try {
       const parsed = await readJsonBody(req);
@@ -611,6 +654,23 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      // Check for required API key based on model
+      const modelIsClaud = isClaudeModel(payload.model);
+      if (modelIsClaud && !anthropicKey && !process.env.ANTHROPIC_API_KEY) {
+        console.log("❌ Missing Anthropic API key for Claude model");
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ error: "Unauthorized - missing Anthropic key" })
+        );
+        return;
+      }
+      if (!modelIsClaud && !openaiKey) {
+        console.log("❌ Missing OpenAI API key for /translate");
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
+        return;
+      }
+
       pruneTranslationJobs();
 
       const job: TranslationJob = {
@@ -619,7 +679,8 @@ const server = createServer(async (req, res) => {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         payload,
-        openaiKey,
+        openaiKey: openaiKey || "",
+        anthropicKey: anthropicKey || undefined,
       };
 
       translationJobs.set(job.id, job);
@@ -918,7 +979,8 @@ const server = createServer(async (req, res) => {
           }
         };
 
-        let nextIndex = 0;
+        // Use a queue to distribute work safely across workers
+        const pendingIndices = segmentsPayload.map((_: any, i: number) => i);
         const workerCount = Math.min(
           DUB_MAX_CONCURRENCY,
           segmentsPayload.length
@@ -932,8 +994,8 @@ const server = createServer(async (req, res) => {
                 return;
               }
 
-              const current = nextIndex++;
-              if (current >= segmentsPayload.length) {
+              const current = pendingIndices.shift();
+              if (current === undefined) {
                 return;
               }
 
