@@ -39,6 +39,26 @@ const DUB_MAX_SEGMENTS = Math.max(
   Number.parseInt(process.env.DUB_MAX_SEGMENTS || "240", 10)
 );
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB limit for request bodies
+const MAX_TRANSLATION_JOBS = 1000; // Memory leak prevention
+const JOB_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes (reduced from 1 hour)
+const R2_FETCH_TIMEOUT_MS = 120_000; // 2 minute timeout for R2 fetches
+
+// Fail fast if RELAY_SECRET is missing - this is critical for security
+const RELAY_SECRET = process.env.RELAY_SECRET;
+if (!RELAY_SECRET) {
+  console.error("❌ FATAL: RELAY_SECRET environment variable is not set");
+  process.exit(1);
+}
+
+// Allowed CORS origins (restrict in production)
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
+  : ["*"]; // Default to * for backwards compatibility
+
+// Allowed R2 bucket hostnames for SSRF prevention
+const ALLOWED_R2_HOSTS = process.env.ALLOWED_R2_HOSTS
+  ? process.env.ALLOWED_R2_HOSTS.split(",").map((h) => h.trim().toLowerCase())
+  : [];
 
 type TranslationJobStatus = "queued" | "processing" | "completed" | "failed";
 
@@ -69,6 +89,105 @@ type TranslationJob = {
 };
 
 const translationJobs = new Map<string, TranslationJob>();
+
+// ============================================================================
+// Helper Functions (DRY consolidation)
+// ============================================================================
+
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+/**
+ * Validate the relay secret from request headers.
+ * Returns true if valid, false otherwise.
+ */
+function validateRelaySecret(req: IncomingMessage): boolean {
+  const relaySecretHeader = req.headers["x-relay-secret"];
+  const providedSecret = Array.isArray(relaySecretHeader)
+    ? relaySecretHeader[0]
+    : relaySecretHeader;
+  return providedSecret === RELAY_SECRET;
+}
+
+/**
+ * Extract a single header value (handles array headers).
+ */
+function getHeader(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0];
+  return value || undefined;
+}
+
+/**
+ * Send a JSON error response.
+ */
+function sendError(
+  res: ServerResponse,
+  status: number,
+  error: string,
+  details?: string
+): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(details ? { error, details } : { error }));
+}
+
+/**
+ * Send a JSON success response.
+ */
+function sendJson(res: ServerResponse, data: unknown, status = 200): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(data));
+}
+
+/**
+ * Validate R2 URL to prevent SSRF attacks.
+ * Only allows URLs from configured R2 bucket hosts.
+ */
+function validateR2Url(urlString: string): { valid: boolean; error?: string } {
+  try {
+    const url = new URL(urlString);
+
+    // Must be HTTPS
+    if (url.protocol !== "https:") {
+      return { valid: false, error: "R2 URL must use HTTPS" };
+    }
+
+    // If no allowed hosts configured, allow any (backwards compat)
+    if (ALLOWED_R2_HOSTS.length === 0) {
+      console.warn("⚠️ ALLOWED_R2_HOSTS not configured - allowing any R2 URL");
+      return { valid: true };
+    }
+
+    // Check against whitelist
+    const hostname = url.hostname.toLowerCase();
+    if (!ALLOWED_R2_HOSTS.some((h) => hostname === h || hostname.endsWith(`.${h}`))) {
+      return { valid: false, error: `R2 URL hostname not in allowed list: ${hostname}` };
+    }
+
+    return { valid: true };
+  } catch {
+    return { valid: false, error: "Invalid R2 URL format" };
+  }
+}
+
+/**
+ * Get the CORS origin to return based on the request origin.
+ */
+function getCorsOrigin(req: IncomingMessage): string {
+  const requestOrigin = getHeader(req, "origin");
+
+  // If wildcard is allowed, return wildcard
+  if (ALLOWED_ORIGINS.includes("*")) {
+    return "*";
+  }
+
+  // If request origin is in allowed list, return it
+  if (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin)) {
+    return requestOrigin;
+  }
+
+  // Default to first allowed origin
+  return ALLOWED_ORIGINS[0] || "*";
+}
 
 function readJsonBody(req: any): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -139,13 +258,27 @@ function chunkLines(lines: string[], maxChars: number): string[] {
   return chunks;
 }
 
-function pruneTranslationJobs(maxAgeMs = 1000 * 60 * 60) {
+function pruneTranslationJobs(maxAgeMs = JOB_MAX_AGE_MS) {
   const now = Date.now();
+
+  // First pass: remove old completed/failed jobs
   for (const [jobId, job] of translationJobs) {
     if (
       (job.status === "completed" || job.status === "failed") &&
       now - job.createdAt > maxAgeMs
     ) {
+      translationJobs.delete(jobId);
+    }
+  }
+
+  // Memory leak prevention: if still over limit, remove oldest jobs
+  if (translationJobs.size > MAX_TRANSLATION_JOBS) {
+    const sortedJobs = [...translationJobs.entries()]
+      .sort((a, b) => a[1].createdAt - b[1].createdAt);
+
+    const toRemove = sortedJobs.slice(0, translationJobs.size - MAX_TRANSLATION_JOBS);
+    for (const [jobId] of toRemove) {
+      console.warn(`⚠️ Removing job ${jobId} due to job limit (${MAX_TRANSLATION_JOBS})`);
       translationJobs.delete(jobId);
     }
   }
@@ -347,13 +480,17 @@ const server = createServer(async (req, res) => {
     }`
   );
 
-  // Enable CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  // Enable CORS with configurable origins
+  const corsOrigin = getCorsOrigin(req);
+  res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key, X-Anthropic-Key"
+    "Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key, X-Anthropic-Key, X-ElevenLabs-Key"
   );
+  if (corsOrigin !== "*") {
+    res.setHeader("Vary", "Origin");
+  }
 
   // Handle preflight requests
   if (req.method === "OPTIONS") {
@@ -367,120 +504,90 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/speech") {
     console.log("🎤 Processing speech synthesis request...");
 
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret for /speech");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    const openaiKeyHeader = req.headers["x-openai-key"];
-    const openaiKey = Array.isArray(openaiKeyHeader)
-      ? openaiKeyHeader[0]
-      : openaiKeyHeader;
+    const openaiKey = getHeader(req, "x-openai-key");
     if (!openaiKey) {
       console.log("❌ Missing OpenAI API key for /speech");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
+      sendError(res, 401, "Unauthorized - missing OpenAI key");
       return;
     }
 
-    try {
-      let body = "";
-      let bodySize = 0;
-      let rejected = false;
-      req.on("data", (chunk) => {
-        if (rejected) return;
-        bodySize += chunk.length;
-        if (bodySize > MAX_BODY_SIZE) {
-          rejected = true;
-          res.writeHead(413, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Request body too large" }));
-          req.destroy();
+    let body = "";
+    let bodySize = 0;
+    let rejected = false;
+
+    req.on("data", (chunk: Buffer) => {
+      if (rejected) return;
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY_SIZE) {
+        rejected = true;
+        sendError(res, 413, "Request body too large");
+        req.destroy();
+        return;
+      }
+      body += chunk.toString();
+    });
+
+    req.on("error", (err) => {
+      if (rejected) return;
+      rejected = true;
+      console.error("❌ Request stream error in /speech:", err.message);
+      sendError(res, 500, "Request stream error", err.message);
+    });
+
+    req.on("end", async () => {
+      if (rejected) return;
+      try {
+        const parsed = JSON.parse(body || "{}");
+        const text = parsed.text;
+        if (!text || typeof text !== "string") {
+          sendError(res, 400, "Invalid request: text is required");
           return;
         }
-        body += chunk.toString();
-      });
 
-      req.on("end", async () => {
-        if (rejected) return;
-        try {
-          const parsed = JSON.parse(body || "{}");
-          const text = parsed.text;
-          if (!text || typeof text !== "string") {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({ error: "Invalid request: text is required" })
-            );
-            return;
-          }
+        const voice = parsed.voice || "alloy";
+        const model = parsed.model || "tts-1";
+        const format = parsed.format || "mp3";
+        const responseFormat = parsed.response_format;
 
-          const voice = parsed.voice || "alloy";
-          const model = parsed.model || "tts-1";
-          const format = parsed.format || "mp3";
-          const responseFormat = parsed.response_format;
+        console.log(
+          `🎶 Generating speech (${text.length} chars) model=${model} voice=${voice} format=${format}`
+        );
 
-          console.log(
-            `🎶 Generating speech (${text.length} chars) model=${model} voice=${voice} format=${format}`
-          );
+        const client = makeOpenAI(openaiKey);
+        const speech = await client.audio.speech.create({
+          model,
+          voice,
+          input: text,
+          ...(responseFormat || format
+            ? { response_format: responseFormat || format }
+            : {}),
+        });
 
-          const client = makeOpenAI(openaiKey);
-          const speech = await client.audio.speech.create({
-            model,
-            voice,
-            input: text,
-            ...(responseFormat || format
-              ? { response_format: responseFormat || format }
-              : {}),
-          });
+        const arrayBuffer = await speech.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        const audioBase64 = buffer.toString("base64");
 
-          const arrayBuffer = await speech.arrayBuffer();
-          const buffer = Buffer.from(arrayBuffer);
-          const audioBase64 = buffer.toString("base64");
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              audioBase64,
-              voice,
-              model,
-              format,
-              length: text.length,
-            })
-          );
-        } catch (error: any) {
-          console.error(
-            "❌ Relay speech synthesis error:",
-            error.message || error
-          );
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "Speech synthesis failed",
-              details: error?.message || String(error),
-            })
-          );
-        }
-      });
-    } catch (error: any) {
-      console.error("❌ Relay speech handler error:", error.message || error);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Speech synthesis failed",
-          details: error?.message || String(error),
-        })
-      );
-    }
+        sendJson(res, {
+          audioBase64,
+          voice,
+          model,
+          format,
+          length: text.length,
+        });
+      } catch (error: any) {
+        console.error(
+          "❌ Relay speech synthesis error:",
+          error.message || error
+        );
+        sendError(res, 500, "Speech synthesis failed", error?.message || String(error));
+      }
+    });
 
     return;
   }
@@ -489,27 +596,15 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/transcribe") {
     console.log("📡 Processing transcribe request...");
 
-    // Validate relay secret
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
     console.log("🎯 Relay secret validated, processing transcription...");
 
     try {
-      // Parse the multipart form data
       const form = new IncomingForm({
         maxFileSize: 500 * 1024 * 1024, // 500MB for long audio files
       });
@@ -518,8 +613,7 @@ const server = createServer(async (req, res) => {
       const file = Array.isArray(files.file) ? files.file[0] : files.file;
       if (!file) {
         console.log("❌ No file provided");
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No file provided" }));
+        sendError(res, 400, "No file provided");
         return;
       }
 
@@ -537,19 +631,14 @@ const server = createServer(async (req, res) => {
         `🎵 Transcribing file: ${file.originalFilename} (${(file.size / 1024 / 1024).toFixed(1)}MB) with model: ${model}`
       );
 
-      // Only whisper-1 (OpenAI) is supported
-      const openaiKey = req.headers["x-openai-key"] as string;
+      const openaiKey = getHeader(req, "x-openai-key");
       if (!openaiKey) {
         console.log("❌ Missing OpenAI API key");
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "Unauthorized - missing OpenAI key" })
-        );
+        sendError(res, 401, "Unauthorized - missing OpenAI key");
         return;
       }
       const client = makeOpenAI(openaiKey);
 
-      // Read the file and create a proper File object
       const fs = await import("fs");
       const fileBuffer = await fs.promises.readFile(file.filepath);
       const fileBlob = new File(
@@ -570,19 +659,10 @@ const server = createServer(async (req, res) => {
       });
 
       console.log(`🎯 Relay transcription completed successfully using OpenAI!`);
-
-      // Send the real transcription result
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(transcription));
+      sendJson(res, transcription);
     } catch (error: any) {
       console.error("❌ Relay transcription error:", error.message);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Transcription failed",
-          details: error.message,
-        })
-      );
+      sendError(res, 500, "Transcription failed", error.message);
     }
 
     return;
@@ -592,32 +672,16 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/transcribe-elevenlabs") {
     console.log("📡 Processing ElevenLabs Scribe transcription request...");
 
-    // Validate relay secret
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    // Get ElevenLabs key from header (passed from stage5-api) or fallback to env
-    const elevenLabsKeyHeader = req.headers["x-elevenlabs-key"];
-    const elevenLabsKey = Array.isArray(elevenLabsKeyHeader)
-      ? elevenLabsKeyHeader[0]
-      : elevenLabsKeyHeader || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "ElevenLabs not configured" }));
+      sendError(res, 500, "ElevenLabs not configured");
       return;
     }
 
@@ -630,8 +694,7 @@ const server = createServer(async (req, res) => {
       const file = Array.isArray(files.file) ? files.file[0] : files.file;
       if (!file) {
         console.log("❌ No file provided");
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No file provided" }));
+        sendError(res, 400, "No file provided");
         return;
       }
 
@@ -675,18 +738,10 @@ const server = createServer(async (req, res) => {
       };
 
       console.log(`🎯 ElevenLabs Scribe transcription completed!`);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(whisperFormat));
+      sendJson(res, whisperFormat);
     } catch (error: any) {
       console.error("❌ ElevenLabs Scribe error:", error.message);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Transcription failed",
-          details: error.message,
-        })
-      );
+      sendError(res, 500, "Transcription failed", error.message);
     }
 
     return;
@@ -696,30 +751,16 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/transcribe-from-r2") {
     console.log("📡 Processing ElevenLabs Scribe from R2 URL...");
 
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret for /transcribe-from-r2");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    const elevenLabsKeyHeader = req.headers["x-elevenlabs-key"];
-    const elevenLabsKey = Array.isArray(elevenLabsKeyHeader)
-      ? elevenLabsKeyHeader[0]
-      : elevenLabsKeyHeader || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "ElevenLabs not configured" }));
+      sendError(res, 500, "ElevenLabs not configured");
       return;
     }
 
@@ -732,21 +773,36 @@ const server = createServer(async (req, res) => {
       const { r2Url, language } = JSON.parse(body);
 
       if (!r2Url) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "r2Url is required" }));
+        sendError(res, 400, "r2Url is required");
+        return;
+      }
+
+      // SSRF prevention: validate R2 URL
+      const r2Validation = validateR2Url(r2Url);
+      if (!r2Validation.valid) {
+        console.log(`❌ Invalid R2 URL: ${r2Validation.error}`);
+        sendError(res, 400, "Invalid R2 URL", r2Validation.error);
         return;
       }
 
       console.log(`🎵 Fetching audio from R2 for transcription...`);
 
-      // Fetch the file from R2
-      const r2Response = await fetch(r2Url);
+      // Fetch the file from R2 with timeout
+      const abortController = new AbortController();
+      const timeoutId = setTimeout(() => abortController.abort(), R2_FETCH_TIMEOUT_MS);
+
+      let r2Response: Response;
+      try {
+        r2Response = await fetch(r2Url, { signal: abortController.signal });
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
       if (!r2Response.ok) {
         throw new Error(`Failed to fetch from R2: ${r2Response.status}`);
       }
 
       const audioBuffer = Buffer.from(await r2Response.arrayBuffer());
-      const contentType = r2Response.headers.get("content-type") || "audio/webm";
       const fileSizeMB = audioBuffer.length / (1024 * 1024);
 
       console.log(`🎵 Transcribing with ElevenLabs Scribe (${fileSizeMB.toFixed(1)}MB from R2)`);
@@ -801,24 +857,18 @@ const server = createServer(async (req, res) => {
         };
 
         console.log(`🎯 ElevenLabs Scribe (R2) completed! Duration: ${duration.toFixed(1)}s`);
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(whisperFormat));
+        sendJson(res, whisperFormat);
       } finally {
         // Cleanup temp file
         try {
           await fs.promises.unlink(tempFile);
-        } catch {}
+        } catch (cleanupErr: any) {
+          console.warn(`⚠️ Failed to cleanup temp file ${tempFile}:`, cleanupErr.message);
+        }
       }
     } catch (error: any) {
       console.error("❌ ElevenLabs Scribe (R2) error:", error.message);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Transcription from R2 failed",
-          details: error.message,
-        })
-      );
+      sendError(res, 500, "Transcription from R2 failed", error.message);
     }
 
     return;
@@ -828,31 +878,16 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/dub-elevenlabs") {
     console.log("🎬 Processing ElevenLabs TTS dub request...");
 
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret for /dub-elevenlabs");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    // Get ElevenLabs key from header (passed from stage5-api) or fallback to env
-    const elevenLabsKeyHeader = req.headers["x-elevenlabs-key"];
-    const elevenLabsKey = Array.isArray(elevenLabsKeyHeader)
-      ? elevenLabsKeyHeader[0]
-      : elevenLabsKeyHeader || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "ElevenLabs not configured" }));
+      sendError(res, 500, "ElevenLabs not configured");
       return;
     }
 
@@ -868,7 +903,7 @@ const server = createServer(async (req, res) => {
                 ? Number(segment.index)
                 : idx + 1;
               const targetDuration =
-                typeof segment?.targetDuration === "number"
+                typeof segment?.targetDuration === "number" && Number.isFinite(segment.targetDuration)
                   ? segment.targetDuration
                   : undefined;
               return { index, text, targetDuration };
@@ -877,8 +912,7 @@ const server = createServer(async (req, res) => {
         : [];
 
       if (!segmentsPayload.length) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No valid segments provided" }));
+        sendError(res, 400, "No valid segments provided");
         return;
       }
 
@@ -922,26 +956,17 @@ const server = createServer(async (req, res) => {
         );
       }
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          voice,
-          model: "eleven_multilingual_v2",
-          format: "mp3",
-          segmentCount: segmentResponses.length,
-          totalCharacters,
-          segments: segmentResponses,
-        })
-      );
+      sendJson(res, {
+        voice,
+        model: "eleven_multilingual_v2",
+        format: "mp3",
+        segmentCount: segmentResponses.length,
+        totalCharacters,
+        segments: segmentResponses,
+      });
     } catch (error: any) {
       console.error("❌ ElevenLabs TTS error:", error.message);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Dub synthesis failed",
-          details: error.message,
-        })
-      );
+      sendError(res, 500, "Dub synthesis failed", error.message);
     }
 
     return;
@@ -951,31 +976,16 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/dub-video-elevenlabs") {
     console.log("🎬 Processing ElevenLabs video dubbing request...");
 
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret for /dub-video-elevenlabs");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    // Get ElevenLabs key from header (passed from stage5-api) or fallback to env
-    const elevenLabsKeyHeader = req.headers["x-elevenlabs-key"];
-    const elevenLabsKey = Array.isArray(elevenLabsKeyHeader)
-      ? elevenLabsKeyHeader[0]
-      : elevenLabsKeyHeader || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "ElevenLabs not configured" }));
+      sendError(res, 500, "ElevenLabs not configured");
       return;
     }
 
@@ -988,8 +998,7 @@ const server = createServer(async (req, res) => {
       const file = Array.isArray(files.file) ? files.file[0] : files.file;
       if (!file) {
         console.log("❌ No file provided for dubbing");
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No file provided" }));
+        sendError(res, 400, "No file provided");
         return;
       }
 
@@ -998,8 +1007,7 @@ const server = createServer(async (req, res) => {
         : fields.target_language;
       if (!targetLanguage) {
         console.log("❌ No target language provided");
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "target_language is required" }));
+        sendError(res, 400, "target_language is required");
         return;
       }
 
@@ -1009,8 +1017,10 @@ const server = createServer(async (req, res) => {
       const numSpeakersField = Array.isArray(fields.num_speakers)
         ? fields.num_speakers[0]
         : fields.num_speakers;
-      const numSpeakers = numSpeakersField
-        ? parseInt(numSpeakersField, 10)
+      // Safe parseInt with Number.isFinite validation
+      const numSpeakersRaw = numSpeakersField ? parseInt(numSpeakersField, 10) : undefined;
+      const numSpeakers = numSpeakersRaw !== undefined && Number.isFinite(numSpeakersRaw) && numSpeakersRaw > 0
+        ? numSpeakersRaw
         : undefined;
       const dropBackgroundAudioField = Array.isArray(
         fields.drop_background_audio
@@ -1039,18 +1049,10 @@ const server = createServer(async (req, res) => {
       });
 
       console.log(`🎯 ElevenLabs video dubbing completed!`);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(result));
+      sendJson(res, result);
     } catch (error: any) {
       console.error("❌ ElevenLabs video dubbing error:", error.message);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Video dubbing failed",
-          details: error.message,
-        })
-      );
+      sendError(res, 500, "Video dubbing failed", error.message);
     }
 
     return;
@@ -1060,31 +1062,14 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/translate") {
     console.log("🌐 Processing translate request (job)...");
 
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    const openaiKeyHeader = req.headers["x-openai-key"];
-    const openaiKey = Array.isArray(openaiKeyHeader)
-      ? openaiKeyHeader[0]
-      : openaiKeyHeader;
-
-    const anthropicKeyHeader = req.headers["x-anthropic-key"];
-    const anthropicKey = Array.isArray(anthropicKeyHeader)
-      ? anthropicKeyHeader[0]
-      : anthropicKeyHeader;
+    const openaiKey = getHeader(req, "x-openai-key");
+    const anthropicKey = getHeader(req, "x-anthropic-key");
 
     try {
       const parsed = await readJsonBody(req);
@@ -1124,13 +1109,7 @@ const server = createServer(async (req, res) => {
       }
 
       if (!payload) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            error: "Invalid translation payload",
-            details: "Expected messages[] or text/target_language",
-          })
-        );
+        sendError(res, 400, "Invalid translation payload", "Expected messages[] or text/target_language");
         return;
       }
 
@@ -1138,16 +1117,12 @@ const server = createServer(async (req, res) => {
       const modelIsClaud = isClaudeModel(payload.model);
       if (modelIsClaud && !anthropicKey && !process.env.ANTHROPIC_API_KEY) {
         console.log("❌ Missing Anthropic API key for Claude model");
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "Unauthorized - missing Anthropic key" })
-        );
+        sendError(res, 401, "Unauthorized - missing Anthropic key");
         return;
       }
       if (!modelIsClaud && !openaiKey) {
         console.log("❌ Missing OpenAI API key for /translate");
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
+        sendError(res, 401, "Unauthorized - missing OpenAI key");
         return;
       }
 
@@ -1165,8 +1140,7 @@ const server = createServer(async (req, res) => {
 
       translationJobs.set(job.id, job);
 
-      res.writeHead(202, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ jobId: job.id, status: job.status }));
+      sendJson(res, { jobId: job.id, status: job.status }, 202);
 
       setImmediate(() => {
         processTranslationJob(job)
@@ -1190,13 +1164,7 @@ const server = createServer(async (req, res) => {
         "❌ Relay translation job submission error:",
         error.message
       );
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Translation job submission failed",
-          details: error.message,
-        })
-      );
+      sendError(res, 500, "Translation job submission failed", error.message);
     }
 
     return;
@@ -1206,18 +1174,8 @@ const server = createServer(async (req, res) => {
     req.url &&
     req.url.startsWith("/translate/result/")
   ) {
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+    if (!validateRelaySecret(req)) {
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
@@ -1226,22 +1184,14 @@ const server = createServer(async (req, res) => {
     );
     const job = translationJobs.get(jobId);
     if (!job) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Job not found" }));
+      sendError(res, 404, "Job not found");
       return;
     }
 
     if (job.status === "completed") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(job.result ?? {}));
+      sendJson(res, job.result ?? {});
     } else if (job.status === "failed") {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: job.error?.message || "Translation failed",
-          details: job.error?.details,
-        })
-      );
+      sendError(res, 500, job.error?.message || "Translation failed", job.error?.details);
     } else {
       res.writeHead(202, {
         "Content-Type": "application/json",
@@ -1255,30 +1205,16 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/dub") {
     console.log("🎬 Processing dub synthesis request...");
 
-    const relaySecretHeader = req.headers["x-relay-secret"];
-    const providedSecret = Array.isArray(relaySecretHeader)
-      ? relaySecretHeader[0]
-      : relaySecretHeader;
-    const expectedSecret = process.env.RELAY_SECRET;
-    if (
-      !providedSecret ||
-      !expectedSecret ||
-      providedSecret !== expectedSecret
-    ) {
+    if (!validateRelaySecret(req)) {
       console.log("❌ Invalid or missing relay secret for /dub");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - invalid relay secret" }));
+      sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    const openaiKeyHeader = req.headers["x-openai-key"];
-    const openaiKey = Array.isArray(openaiKeyHeader)
-      ? openaiKeyHeader[0]
-      : openaiKeyHeader;
+    const openaiKey = getHeader(req, "x-openai-key");
     if (!openaiKey) {
       console.log("❌ Missing OpenAI API key for /dub");
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized - missing OpenAI key" }));
+      sendError(res, 401, "Unauthorized - missing OpenAI key");
       return;
     }
 
@@ -1353,13 +1289,7 @@ const server = createServer(async (req, res) => {
 
       if (segmentsPayload.length > 0) {
         if (segmentsPayload.length > DUB_MAX_SEGMENTS) {
-          res.writeHead(413, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "Dub request too large",
-              details: `Received ${segmentsPayload.length} segments, limit is ${DUB_MAX_SEGMENTS}`,
-            })
-          );
+          sendError(res, 413, "Dub request too large", `Received ${segmentsPayload.length} segments, limit is ${DUB_MAX_SEGMENTS}`);
           return;
         }
 
@@ -1369,13 +1299,7 @@ const server = createServer(async (req, res) => {
         );
 
         if (totalCharacters > DUB_MAX_TOTAL_CHARACTERS) {
-          res.writeHead(413, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "Dub request too large",
-              details: `Received ${totalCharacters} characters, limit is ${DUB_MAX_TOTAL_CHARACTERS}`,
-            })
-          );
+          sendError(res, 413, "Dub request too large", `Received ${totalCharacters} characters, limit is ${DUB_MAX_TOTAL_CHARACTERS}`);
           return;
         }
 
@@ -1509,13 +1433,7 @@ const server = createServer(async (req, res) => {
 
           const details = segmentError?.response?.data ?? segmentError?.message;
           console.error("❌ Relay segment synthesis failed:", details);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "Dub synthesis failed",
-              details,
-            })
-          );
+          sendError(res, 500, "Dub synthesis failed", typeof details === "string" ? details : JSON.stringify(details));
           return;
         }
 
@@ -1528,25 +1446,19 @@ const server = createServer(async (req, res) => {
 
         const completedSegments = segmentResponses.filter(Boolean);
 
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            voice,
-            model,
-            format,
-            segmentCount: completedSegments.length,
-            totalCharacters,
-            segments: completedSegments,
-          })
-        );
+        sendJson(res, {
+          voice,
+          model,
+          format,
+          segmentCount: completedSegments.length,
+          totalCharacters,
+          segments: completedSegments,
+        });
         return;
       }
 
       if (!lines.length) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: "Invalid request: lines array required" })
-        );
+        sendError(res, 400, "Invalid request: lines array required");
         return;
       }
 
@@ -1557,8 +1469,7 @@ const server = createServer(async (req, res) => {
       const chunks = chunkLines(lines, MAX_TTS_CHARS_PER_CHUNK);
 
       if (!chunks.length) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No valid dialogue for dubbing" }));
+        sendError(res, 400, "No valid dialogue for dubbing");
         return;
       }
 
@@ -1586,35 +1497,25 @@ const server = createServer(async (req, res) => {
       const combined = Buffer.concat(chunkBuffers);
       const audioBase64 = combined.toString("base64");
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          audioBase64,
-          voice,
-          model,
-          format,
-          chunkCount: chunks.length,
-          totalCharacters,
-        })
-      );
+      sendJson(res, {
+        audioBase64,
+        voice,
+        model,
+        format,
+        chunkCount: chunks.length,
+        totalCharacters,
+      });
       return;
     } catch (error: any) {
       console.error("❌ Relay dub synthesis error:", error?.message || error);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Dub synthesis failed",
-          details: error?.message || String(error),
-        })
-      );
+      sendError(res, 500, "Dub synthesis failed", error?.message || String(error));
       return;
     }
   }
 
   // Handle all other requests
   console.log(`❌ Unsupported request: ${req.method} ${req.url}`);
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "Endpoint not found" }));
+  sendError(res, 404, "Endpoint not found");
 });
 
 server.listen(PORT, () => {

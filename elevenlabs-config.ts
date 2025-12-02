@@ -207,6 +207,12 @@ export async function synthesizeWithElevenLabs({
     josh: "TxGEqnHWrfWFTfGW9XjX",
     arnold: "VR6AewLTigWG4xSOukaG",
     sam: "yoZ06aMxZJJ28mfd3POQ",
+    // Additional ElevenLabs voices
+    sarah: "EXAVITQu4vr4xnSDxMaL", // American, young, soft (same as bella)
+    charlie: "IKne3meq5aSn9XLyUdCD", // Australian, middle-aged, casual
+    emily: "LcfcDJNUP1GQjkzn1xUU", // American, young, calm
+    matilda: "XrExE9yKIg1WjnnlVkGX", // American, middle-aged, warm
+    brian: "nPczCjzI2devNBz1zQrb", // American, middle-aged, deep
     // OpenAI voice name mappings for compatibility
     alloy: "pNInz6obpgDQGcFmaJgB", // map to adam
     echo: "VR6AewLTigWG4xSOukaG", // map to arnold
