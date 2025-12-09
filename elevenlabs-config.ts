@@ -268,6 +268,70 @@ export async function testElevenLabsKey(apiKey: string): Promise<boolean> {
 
 // --- ElevenLabs Dubbing API ---
 
+// Map full language names to ISO 639-1 codes (ElevenLabs requires ISO codes)
+const LANGUAGE_CODE_MAP: Record<string, string> = {
+  // Common language name mappings
+  english: "en",
+  spanish: "es",
+  french: "fr",
+  german: "de",
+  italian: "it",
+  portuguese: "pt",
+  dutch: "nl",
+  polish: "pl",
+  russian: "ru",
+  japanese: "ja",
+  korean: "ko",
+  chinese: "zh",
+  "chinese (simplified)": "zh",
+  "chinese (traditional)": "zh",
+  arabic: "ar",
+  hindi: "hi",
+  turkish: "tr",
+  vietnamese: "vi",
+  thai: "th",
+  indonesian: "id",
+  malay: "ms",
+  filipino: "fil",
+  tagalog: "fil",
+  swedish: "sv",
+  norwegian: "no",
+  danish: "da",
+  finnish: "fi",
+  greek: "el",
+  hebrew: "he",
+  czech: "cs",
+  hungarian: "hu",
+  romanian: "ro",
+  ukrainian: "uk",
+  bulgarian: "bg",
+  croatian: "hr",
+  slovak: "sk",
+  slovenian: "sl",
+  serbian: "sr",
+  tamil: "ta",
+  telugu: "te",
+  bengali: "bn",
+  urdu: "ur",
+  gujarati: "gu",
+  kannada: "kn",
+  malayalam: "ml",
+  marathi: "mr",
+  punjabi: "pa",
+};
+
+/**
+ * Convert language name or code to ISO 639-1 code
+ */
+function normalizeLanguageCode(lang: string): string {
+  if (!lang) return lang;
+  const lower = lang.toLowerCase().trim();
+  // If it's already a 2-3 character code, assume it's valid
+  if (lower.length <= 3) return lower;
+  // Look up in mapping
+  return LANGUAGE_CODE_MAP[lower] || lower;
+}
+
 export interface DubbingJobResponse {
   dubbing_id: string;
   expected_duration_sec: number;
@@ -309,18 +373,24 @@ export async function submitDubbingJob({
   numSpeakers?: number;
   dropBackgroundAudio?: boolean;
 }): Promise<DubbingJobResponse> {
+  // Normalize language codes (convert full names like "korean" to ISO codes like "ko")
+  const normalizedTargetLang = normalizeLanguageCode(targetLanguage);
+  const normalizedSourceLang = sourceLanguage
+    ? normalizeLanguageCode(sourceLanguage)
+    : undefined;
+
   const formData = new FormData();
   formData.append(
     "file",
     new Blob([new Uint8Array(fileBuffer)], { type: mimeType }),
     fileName
   );
-  formData.append("target_lang", targetLanguage);
+  formData.append("target_lang", normalizedTargetLang);
   formData.append("mode", "automatic");
   formData.append("drop_background_audio", String(dropBackgroundAudio));
 
-  if (sourceLanguage) {
-    formData.append("source_lang", sourceLanguage);
+  if (normalizedSourceLang) {
+    formData.append("source_lang", normalizedSourceLang);
   }
   if (numSpeakers && numSpeakers > 0) {
     formData.append("num_speakers", String(numSpeakers));
@@ -375,8 +445,9 @@ export async function getDubbedAudio(
   languageCode: string,
   apiKey: string
 ): Promise<Buffer> {
+  const normalizedLang = normalizeLanguageCode(languageCode);
   const response = await fetch(
-    `${ELEVENLABS_API_BASE}/dubbing/${dubbingId}/audio/${languageCode}`,
+    `${ELEVENLABS_API_BASE}/dubbing/${dubbingId}/audio/${normalizedLang}`,
     {
       headers: {
         "xi-api-key": apiKey,
@@ -403,12 +474,12 @@ export async function getDubbedTranscript(
   languageCode: string,
   apiKey: string
 ): Promise<string> {
+  const normalizedLang = normalizeLanguageCode(languageCode);
   const response = await fetch(
-    `${ELEVENLABS_API_BASE}/dubbing/${dubbingId}/transcript/${languageCode}`,
+    `${ELEVENLABS_API_BASE}/dubbing/${dubbingId}/transcript/${normalizedLang}?format_type=srt`,
     {
       headers: {
         "xi-api-key": apiKey,
-        Accept: "application/json",
       },
     }
   );
@@ -420,9 +491,20 @@ export async function getDubbedTranscript(
     );
   }
 
-  // ElevenLabs returns JSON with srt field
-  const data = await response.json();
-  return data.srt || "";
+  // ElevenLabs returns plain SRT text when format_type=srt is specified
+  const text = await response.text();
+
+  // If it looks like JSON, try to parse it
+  if (text.startsWith("{")) {
+    try {
+      const data = JSON.parse(text);
+      return data.srt || text;
+    } catch {
+      return text;
+    }
+  }
+
+  return text;
 }
 
 /**

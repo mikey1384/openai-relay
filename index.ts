@@ -159,8 +159,15 @@ function validateR2Url(urlString: string): { valid: boolean; error?: string } {
 
     // Check against whitelist
     const hostname = url.hostname.toLowerCase();
-    if (!ALLOWED_R2_HOSTS.some((h) => hostname === h || hostname.endsWith(`.${h}`))) {
-      return { valid: false, error: `R2 URL hostname not in allowed list: ${hostname}` };
+    if (
+      !ALLOWED_R2_HOSTS.some(
+        (h) => hostname === h || hostname.endsWith(`.${h}`)
+      )
+    ) {
+      return {
+        valid: false,
+        error: `R2 URL hostname not in allowed list: ${hostname}`,
+      };
     }
 
     return { valid: true };
@@ -273,12 +280,18 @@ function pruneTranslationJobs(maxAgeMs = JOB_MAX_AGE_MS) {
 
   // Memory leak prevention: if still over limit, remove oldest jobs
   if (translationJobs.size > MAX_TRANSLATION_JOBS) {
-    const sortedJobs = [...translationJobs.entries()]
-      .sort((a, b) => a[1].createdAt - b[1].createdAt);
+    const sortedJobs = [...translationJobs.entries()].sort(
+      (a, b) => a[1].createdAt - b[1].createdAt
+    );
 
-    const toRemove = sortedJobs.slice(0, translationJobs.size - MAX_TRANSLATION_JOBS);
+    const toRemove = sortedJobs.slice(
+      0,
+      translationJobs.size - MAX_TRANSLATION_JOBS
+    );
     for (const [jobId] of toRemove) {
-      console.warn(`⚠️ Removing job ${jobId} due to job limit (${MAX_TRANSLATION_JOBS})`);
+      console.warn(
+        `⚠️ Removing job ${jobId} due to job limit (${MAX_TRANSLATION_JOBS})`
+      );
       translationJobs.delete(jobId);
     }
   }
@@ -372,7 +385,11 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
       if (payload.mode === "chat") {
         const { messages, reasoning } = payload;
         // Extract effort level from reasoning object (OpenAI format: { effort: 'high' })
-        const effort = reasoning?.effort as 'low' | 'medium' | 'high' | undefined;
+        const effort = reasoning?.effort as
+          | "low"
+          | "medium"
+          | "high"
+          | undefined;
         const completion = await translateWithClaude({
           messages: messages as any,
           model,
@@ -425,7 +442,10 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
           maybeReasoningError?.status || maybeReasoningError?.response?.status;
         const msg = String(maybeReasoningError?.message || "").toLowerCase();
         // If reasoning_effort caused the error, retry without it
-        if (reasoning?.effort && (status === 400 || msg.includes("reasoning"))) {
+        if (
+          reasoning?.effort &&
+          (status === 400 || msg.includes("reasoning"))
+        ) {
           const reqWithoutReasoning: any = { model, messages };
           completion = await client.chat.completions.create(
             reqWithoutReasoning
@@ -585,7 +605,12 @@ const server = createServer(async (req, res) => {
           "❌ Relay speech synthesis error:",
           error.message || error
         );
-        sendError(res, 500, "Speech synthesis failed", error?.message || String(error));
+        sendError(
+          res,
+          500,
+          "Speech synthesis failed",
+          error?.message || String(error)
+        );
       }
     });
 
@@ -628,7 +653,11 @@ const server = createServer(async (req, res) => {
         : fields.prompt;
 
       console.log(
-        `🎵 Transcribing file: ${file.originalFilename} (${(file.size / 1024 / 1024).toFixed(1)}MB) with model: ${model}`
+        `🎵 Transcribing file: ${file.originalFilename} (${(
+          file.size /
+          1024 /
+          1024
+        ).toFixed(1)}MB) with model: ${model}`
       );
 
       const openaiKey = getHeader(req, "x-openai-key");
@@ -658,7 +687,9 @@ const server = createServer(async (req, res) => {
         timestamp_granularities: ["word", "segment"],
       });
 
-      console.log(`🎯 Relay transcription completed successfully using OpenAI!`);
+      console.log(
+        `🎯 Relay transcription completed successfully using OpenAI!`
+      );
       sendJson(res, transcription);
     } catch (error: any) {
       console.error("❌ Relay transcription error:", error.message);
@@ -678,7 +709,8 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey =
+      getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
       sendError(res, 500, "ElevenLabs not configured");
@@ -703,7 +735,11 @@ const server = createServer(async (req, res) => {
         : fields.language;
 
       console.log(
-        `🎵 Transcribing with ElevenLabs Scribe: ${file.originalFilename} (${(file.size / 1024 / 1024).toFixed(1)}MB)`
+        `🎵 Transcribing with ElevenLabs Scribe: ${file.originalFilename} (${(
+          file.size /
+          1024 /
+          1024
+        ).toFixed(1)}MB)`
       );
 
       const result = await transcribeWithScribe({
@@ -747,7 +783,621 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // Handle POST to /transcribe-from-r2 (ElevenLabs Scribe from R2 URL)
+  // Handle POST to /transcribe-direct (simplified flow - app sends file directly)
+  // Auth and credit deduction handled via CF Worker calls
+  if (req.method === "POST" && req.url === "/transcribe-direct") {
+    console.log("📡 Processing direct transcription request...");
+
+    // Get API key from header (app sends its Stage5 API key)
+    const apiKey = getHeader(req, "authorization")?.replace(/^Bearer\s+/i, "");
+    if (!apiKey) {
+      console.log("❌ Missing API key for /transcribe-direct");
+      sendError(res, 401, "Unauthorized - missing API key");
+      return;
+    }
+
+    const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+    if (!elevenLabsKey) {
+      console.log("❌ ElevenLabs API key not configured");
+      sendError(res, 500, "ElevenLabs not configured");
+      return;
+    }
+
+    // Step 1: Authorize with CF Worker
+    const CF_API_BASE = process.env.CF_API_BASE || "https://api.stage5.tools";
+    console.log(`🔐 Authorizing with CF Worker...`);
+
+    let deviceId: string;
+    try {
+      const authRes = await fetch(`${CF_API_BASE}/transcribe/authorize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Relay-Secret": RELAY_SECRET,
+        },
+        body: JSON.stringify({ apiKey }),
+      });
+
+      if (!authRes.ok) {
+        const authErr = await authRes
+          .json()
+          .catch(() => ({ error: "Auth failed" }));
+        console.log(`❌ Authorization failed: ${authRes.status}`);
+        sendError(
+          res,
+          authRes.status,
+          (authErr as any).error || "Authorization failed"
+        );
+        return;
+      }
+
+      const authData = (await authRes.json()) as {
+        deviceId: string;
+        creditBalance: number;
+      };
+      deviceId = authData.deviceId;
+      console.log(
+        `✅ Authorized device ${deviceId}, balance: ${authData.creditBalance}`
+      );
+    } catch (authErr: any) {
+      console.error("❌ Authorization request failed:", authErr.message);
+      sendError(res, 500, "Authorization failed", authErr.message);
+      return;
+    }
+
+    // Step 2: Parse and transcribe the file
+    try {
+      const form = new IncomingForm({
+        maxFileSize: 500 * 1024 * 1024, // 500MB
+      });
+      const [fields, files] = await form.parse(req);
+
+      const file = Array.isArray(files.file) ? files.file[0] : files.file;
+      if (!file) {
+        console.log("❌ No file provided");
+        sendError(res, 400, "No file provided");
+        return;
+      }
+
+      const language = Array.isArray(fields.language)
+        ? fields.language[0]
+        : fields.language;
+
+      console.log(
+        `🎵 Transcribing with ElevenLabs Scribe: ${file.originalFilename} (${(
+          file.size /
+          1024 /
+          1024
+        ).toFixed(1)}MB)`
+      );
+
+      const result = await transcribeWithScribe({
+        filePath: file.filepath,
+        apiKey: elevenLabsKey,
+        languageCode: language || "auto",
+      });
+
+      // Convert to Whisper-compatible format
+      const allWords = result.segments.flatMap(
+        (seg) =>
+          seg.words?.map((w) => ({
+            word: w.text,
+            start: w.start,
+            end: w.end,
+          })) || []
+      );
+
+      const duration =
+        result.segments.length > 0
+          ? result.segments[result.segments.length - 1].end
+          : 0;
+
+      const whisperFormat = {
+        text: result.text,
+        language: result.language_code,
+        segments: result.segments.map((seg, idx) => ({
+          id: idx,
+          start: seg.start,
+          end: seg.end,
+          text: seg.text,
+          words: seg.words?.map((w) => ({
+            word: w.text,
+            start: w.start,
+            end: w.end,
+          })),
+        })),
+        words: allWords,
+        duration,
+        approx_duration: duration,
+      };
+
+      console.log(
+        `🎯 Transcription completed! Duration: ${duration.toFixed(1)}s`
+      );
+
+      // Step 3: Deduct credits
+      console.log(`💳 Deducting credits for ${Math.ceil(duration)}s...`);
+      try {
+        const deductRes = await fetch(`${CF_API_BASE}/transcribe/deduct`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Relay-Secret": RELAY_SECRET,
+          },
+          body: JSON.stringify({
+            deviceId,
+            durationSeconds: duration,
+          }),
+        });
+
+        if (!deductRes.ok) {
+          const deductErr = await deductRes
+            .json()
+            .catch(() => ({ error: "Deduction failed" }));
+          console.error(
+            `❌ Credit deduction failed: ${deductRes.status}`,
+            deductErr
+          );
+          // Still return the result - we don't want to lose the transcription
+          // Log for manual reconciliation
+          console.error(
+            `⚠️ RECONCILIATION NEEDED: device=${deviceId} duration=${duration}s`
+          );
+        } else {
+          console.log(`✅ Credits deducted successfully`);
+        }
+      } catch (deductErr: any) {
+        console.error("❌ Credit deduction request failed:", deductErr.message);
+        console.error(
+          `⚠️ RECONCILIATION NEEDED: device=${deviceId} duration=${duration}s`
+        );
+      }
+
+      // Return result to app
+      sendJson(res, whisperFormat);
+    } catch (error: any) {
+      console.error("❌ Transcription error:", error.message);
+      sendError(res, 500, "Transcription failed", error.message);
+    }
+
+    return;
+  }
+
+  // Handle POST to /translate-direct (simplified flow - app sends directly)
+  // Auth and credit deduction handled via CF Worker calls
+  if (req.method === "POST" && req.url === "/translate-direct") {
+    console.log("📡 Processing direct translation request...");
+
+    // Get API key from header (app sends its Stage5 API key)
+    const apiKey = getHeader(req, "authorization")?.replace(/^Bearer\s+/i, "");
+    if (!apiKey) {
+      console.log("❌ Missing API key for /translate-direct");
+      sendError(res, 401, "Unauthorized - missing API key");
+      return;
+    }
+
+    // Step 1: Authorize with CF Worker
+    const CF_API_BASE = process.env.CF_API_BASE || "https://api.stage5.tools";
+    console.log(`🔐 Authorizing with CF Worker...`);
+
+    let deviceId: string;
+    try {
+      const authRes = await fetch(`${CF_API_BASE}/auth/authorize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Relay-Secret": RELAY_SECRET,
+        },
+        body: JSON.stringify({ apiKey }),
+      });
+
+      if (!authRes.ok) {
+        const authErr = await authRes
+          .json()
+          .catch(() => ({ error: "Auth failed" }));
+        console.log(`❌ Authorization failed: ${authRes.status}`);
+        sendError(
+          res,
+          authRes.status,
+          (authErr as any).error || "Authorization failed"
+        );
+        return;
+      }
+
+      const authData = (await authRes.json()) as {
+        deviceId: string;
+        creditBalance: number;
+      };
+      deviceId = authData.deviceId;
+      console.log(
+        `✅ Authorized device ${deviceId}, balance: ${authData.creditBalance}`
+      );
+    } catch (authErr: any) {
+      console.error("❌ Authorization request failed:", authErr.message);
+      sendError(res, 500, "Authorization failed", authErr.message);
+      return;
+    }
+
+    // Step 2: Parse request and call OpenAI/Anthropic
+    try {
+      const parsed = await readJsonBody(req);
+      const messages = parsed?.messages;
+      const model = parsed?.model || DEFAULT_TRANSLATION_MODEL;
+      const reasoning = parsed?.reasoning;
+
+      if (!Array.isArray(messages) || messages.length === 0) {
+        sendError(res, 400, "Messages array required");
+        return;
+      }
+
+      console.log(`🌐 Translating with ${model}...`);
+
+      const modelIsClaud = isClaudeModel(model);
+      let result: any;
+      let promptTokens = 0;
+      let completionTokens = 0;
+
+      if (modelIsClaud) {
+        // Use Anthropic
+        const anthropicKey = process.env.ANTHROPIC_API_KEY;
+        if (!anthropicKey) {
+          sendError(res, 500, "Anthropic not configured");
+          return;
+        }
+
+        const effort = reasoning?.effort as
+          | "low"
+          | "medium"
+          | "high"
+          | undefined;
+        const response = await translateWithClaude({
+          messages: messages as any,
+          model,
+          apiKey: anthropicKey,
+          effort,
+        });
+
+        result = response;
+        // translateWithClaude returns { usage: { prompt_tokens, completion_tokens } }
+        promptTokens = (response.usage as any)?.prompt_tokens || 0;
+        completionTokens = (response.usage as any)?.completion_tokens || 0;
+      } else {
+        // Use OpenAI
+        const openaiKey = process.env.OPENAI_API_KEY;
+        if (!openaiKey) {
+          sendError(res, 500, "OpenAI not configured");
+          return;
+        }
+
+        const client = makeOpenAI(openaiKey);
+        const response = await client.chat.completions.create({
+          model,
+          messages: messages.map((m: any) => ({
+            role: m.role,
+            content: m.content,
+          })),
+        });
+
+        result = {
+          content: response.choices[0]?.message?.content || "",
+          model: response.model,
+          usage: response.usage,
+        };
+        promptTokens = response.usage?.prompt_tokens || 0;
+        completionTokens = response.usage?.completion_tokens || 0;
+      }
+
+      console.log(
+        `🎯 Translation complete! Tokens: ${promptTokens}+${completionTokens}`
+      );
+
+      // Step 3: Deduct credits
+      console.log(`💳 Deducting credits...`);
+      try {
+        const deductRes = await fetch(`${CF_API_BASE}/auth/deduct`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Relay-Secret": RELAY_SECRET,
+          },
+          body: JSON.stringify({
+            deviceId,
+            service: "translation",
+            promptTokens,
+            completionTokens,
+            model,
+          }),
+        });
+
+        if (!deductRes.ok) {
+          console.error(`❌ Credit deduction failed: ${deductRes.status}`);
+          console.error(
+            `⚠️ RECONCILIATION NEEDED: device=${deviceId} tokens=${promptTokens}+${completionTokens}`
+          );
+        } else {
+          console.log(`✅ Credits deducted successfully`);
+        }
+      } catch (deductErr: any) {
+        console.error("❌ Credit deduction request failed:", deductErr.message);
+        console.error(
+          `⚠️ RECONCILIATION NEEDED: device=${deviceId} tokens=${promptTokens}+${completionTokens}`
+        );
+      }
+
+      // Return result to app
+      sendJson(res, result);
+    } catch (error: any) {
+      console.error("❌ Translation error:", error.message);
+      sendError(res, 500, "Translation failed", error.message);
+    }
+
+    return;
+  }
+
+  // ElevenLabs voice name to ID mapping
+  const ELEVENLABS_VOICE_IDS: Record<string, string> = {
+    rachel: "21m00Tcm4TlvDq8ikWAM",
+    adam: "pNInz6obpgDQGcFmaJgB",
+    josh: "TxGEqnHWrfWFTfGW9XjX",
+    sarah: "EXAVITQu4vr4xnSDxMaL",
+    charlie: "IKne3meq5aSn9XLyUdCD",
+    emily: "LcfcDJNUP1GQjkzn1xUU",
+    matilda: "XrExE9yKIg1WjnnlVkGX",
+    brian: "nPczCjzI2devNBz1zQrb",
+  };
+
+  // Handle POST to /dub-direct (simplified flow - app sends directly)
+  // Auth and credit deduction handled via CF Worker calls
+  if (req.method === "POST" && req.url === "/dub-direct") {
+    console.log("📡 Processing direct dub request...");
+
+    // Get API key from header (app sends its Stage5 API key)
+    const apiKey = getHeader(req, "authorization")?.replace(/^Bearer\s+/i, "");
+    if (!apiKey) {
+      console.log("❌ Missing API key for /dub-direct");
+      sendError(res, 401, "Unauthorized - missing API key");
+      return;
+    }
+
+    // Step 1: Authorize with CF Worker
+    const CF_API_BASE = process.env.CF_API_BASE || "https://api.stage5.tools";
+    console.log(`🔐 Authorizing with CF Worker...`);
+
+    let deviceId: string;
+    try {
+      const authRes = await fetch(`${CF_API_BASE}/auth/authorize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Relay-Secret": RELAY_SECRET,
+        },
+        body: JSON.stringify({ apiKey }),
+      });
+
+      if (!authRes.ok) {
+        const authErr = await authRes
+          .json()
+          .catch(() => ({ error: "Auth failed" }));
+        console.log(`❌ Authorization failed: ${authRes.status}`);
+        sendError(
+          res,
+          authRes.status,
+          (authErr as any).error || "Authorization failed"
+        );
+        return;
+      }
+
+      const authData = (await authRes.json()) as {
+        deviceId: string;
+        creditBalance: number;
+      };
+      deviceId = authData.deviceId;
+      console.log(
+        `✅ Authorized device ${deviceId}, balance: ${authData.creditBalance}`
+      );
+    } catch (authErr: any) {
+      console.error("❌ Authorization request failed:", authErr.message);
+      sendError(res, 500, "Authorization failed", authErr.message);
+      return;
+    }
+
+    // Step 2: Parse request and synthesize speech
+    try {
+      const parsed = await readJsonBody(req);
+      const segments = parsed?.segments || [];
+      const voice = parsed?.voice || "alloy";
+      const model = parsed?.model || "tts-1";
+      const format = parsed?.format || "mp3";
+      const ttsProvider = parsed?.ttsProvider || "openai";
+
+      if (!Array.isArray(segments) || segments.length === 0) {
+        sendError(res, 400, "Segments array required");
+        return;
+      }
+
+      // Calculate total characters for billing
+      const totalCharacters = segments.reduce(
+        (sum: number, seg: any) =>
+          sum + (seg.text?.length || seg.translation?.length || 0),
+        0
+      );
+
+      console.log(
+        `🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ${ttsProvider}...`
+      );
+
+      let result: any;
+      let ttsModel = model;
+
+      if (ttsProvider === "elevenlabs") {
+        // Use ElevenLabs
+        const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+        if (!elevenLabsKey) {
+          sendError(res, 500, "ElevenLabs not configured");
+          return;
+        }
+
+        // Map voice name to ElevenLabs voice ID
+        const voiceId = ELEVENLABS_VOICE_IDS[voice] || ELEVENLABS_VOICE_IDS.rachel;
+
+        ttsModel = "eleven_multilingual_v2";
+        const segmentResults: Array<{
+          index: number;
+          audioBase64: string;
+          targetDuration?: number;
+        }> = [];
+
+        for (const seg of segments) {
+          const text = seg.text || seg.translation || "";
+          if (!text.trim()) continue;
+
+          const elevenRes = await fetch(
+            `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+            {
+              method: "POST",
+              headers: {
+                "xi-api-key": elevenLabsKey,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                text,
+                model_id: "eleven_multilingual_v2",
+                voice_settings: {
+                  stability: 0.5,
+                  similarity_boost: 0.75,
+                },
+              }),
+            }
+          );
+
+          if (!elevenRes.ok) {
+            const errText = await elevenRes.text();
+            throw new Error(
+              `ElevenLabs API error: ${elevenRes.status} ${errText}`
+            );
+          }
+
+          const audioBuffer = await elevenRes.arrayBuffer();
+          segmentResults.push({
+            index: seg.index ?? segmentResults.length,
+            audioBase64: Buffer.from(audioBuffer).toString("base64"),
+            targetDuration: seg.targetDuration,
+          });
+        }
+
+        result = {
+          segments: segmentResults,
+          format: "mp3",
+          voice,
+          model: ttsModel,
+          segmentCount: segmentResults.length,
+        };
+      } else {
+        // Use OpenAI TTS
+        console.log("   >>> Entering OpenAI TTS branch");
+        const openaiKey = process.env.OPENAI_API_KEY;
+        console.log("   >>> OpenAI key exists:", !!openaiKey);
+        if (!openaiKey) {
+          sendError(res, 500, "OpenAI not configured");
+          return;
+        }
+
+        const client = makeOpenAI(openaiKey);
+        const segmentResults: Array<{
+          index: number;
+          audioBase64: string;
+          targetDuration?: number;
+        }> = [];
+
+        console.log(`   DEBUG: About to process ${segments.length} segments for OpenAI TTS`);
+        console.log(`   DEBUG: First segment:`, JSON.stringify(segments[0]));
+
+        for (const seg of segments) {
+          const text = seg.text || seg.translation || "";
+          if (!text.trim()) continue;
+
+          console.log(
+            `   • OpenAI TTS: voice=${voice}, model=${model}, format=${format}, text="${text.slice(0, 30)}..."`
+          );
+
+          try {
+            const ttsRes = await client.audio.speech.create({
+              model,
+              voice: voice as any,
+              input: text,
+              response_format: format as any,
+            });
+
+            const audioBuffer = await ttsRes.arrayBuffer();
+            segmentResults.push({
+              index: seg.index ?? segmentResults.length,
+              audioBase64: Buffer.from(audioBuffer).toString("base64"),
+              targetDuration: seg.targetDuration,
+            });
+            console.log(`   ✓ OpenAI TTS segment complete`);
+          } catch (ttsErr: any) {
+            console.error(
+              `❌ OpenAI TTS error: ${ttsErr?.message || ttsErr}`,
+              ttsErr?.response?.data || ""
+            );
+            throw ttsErr;
+          }
+        }
+
+        result = {
+          segments: segmentResults,
+          format,
+          voice,
+          model,
+          segmentCount: segmentResults.length,
+        };
+      }
+
+      console.log(`🎯 TTS complete! ${result.segmentCount} segments`);
+
+      // Step 3: Deduct credits
+      console.log(`💳 Deducting credits for ${totalCharacters} characters...`);
+      try {
+        const deductRes = await fetch(`${CF_API_BASE}/auth/deduct`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Relay-Secret": RELAY_SECRET,
+          },
+          body: JSON.stringify({
+            deviceId,
+            service: "tts",
+            characters: totalCharacters,
+            model: ttsModel,
+          }),
+        });
+
+        if (!deductRes.ok) {
+          console.error(`❌ Credit deduction failed: ${deductRes.status}`);
+          console.error(
+            `⚠️ RECONCILIATION NEEDED: device=${deviceId} chars=${totalCharacters}`
+          );
+        } else {
+          console.log(`✅ Credits deducted successfully`);
+        }
+      } catch (deductErr: any) {
+        console.error("❌ Credit deduction request failed:", deductErr.message);
+        console.error(
+          `⚠️ RECONCILIATION NEEDED: device=${deviceId} chars=${totalCharacters}`
+        );
+      }
+
+      // Return result to app
+      sendJson(res, result);
+    } catch (error: any) {
+      console.error("❌ Dub error:", error.message);
+      sendError(res, 500, "Dub synthesis failed", error.message);
+    }
+
+    return;
+  }
+
+  // Handle POST to /transcribe-from-r2 (ElevenLabs Scribe from R2 URL) - LEGACY
   if (req.method === "POST" && req.url === "/transcribe-from-r2") {
     console.log("📡 Processing ElevenLabs Scribe from R2 URL...");
 
@@ -757,12 +1407,16 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey =
+      getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
       sendError(res, 500, "ElevenLabs not configured");
       return;
     }
+
+    // Capture relay secret for webhook callback
+    const relaySecret = getHeader(req, "x-relay-secret") || "";
 
     try {
       // Parse JSON body
@@ -770,7 +1424,7 @@ const server = createServer(async (req, res) => {
       for await (const chunk of req) {
         body += chunk;
       }
-      const { r2Url, language } = JSON.parse(body);
+      const { r2Url, language, webhookUrl } = JSON.parse(body);
 
       if (!r2Url) {
         sendError(res, 400, "r2Url is required");
@@ -787,85 +1441,162 @@ const server = createServer(async (req, res) => {
 
       console.log(`🎵 Fetching audio from R2 for transcription...`);
 
-      // Fetch the file from R2 with timeout
-      const abortController = new AbortController();
-      const timeoutId = setTimeout(() => abortController.abort(), R2_FETCH_TIMEOUT_MS);
-
-      let r2Response: Response;
-      try {
-        r2Response = await fetch(r2Url, { signal: abortController.signal });
-      } finally {
-        clearTimeout(timeoutId);
-      }
-
-      if (!r2Response.ok) {
-        throw new Error(`Failed to fetch from R2: ${r2Response.status}`);
-      }
-
-      const audioBuffer = Buffer.from(await r2Response.arrayBuffer());
-      const fileSizeMB = audioBuffer.length / (1024 * 1024);
-
-      console.log(`🎵 Transcribing with ElevenLabs Scribe (${fileSizeMB.toFixed(1)}MB from R2)`);
-
-      // Write to temp file for ElevenLabs
-      const fs = await import("fs");
-      const os = await import("os");
-      const path = await import("path");
-      const tempFile = path.join(os.tmpdir(), `r2-audio-${Date.now()}.webm`);
-      await fs.promises.writeFile(tempFile, audioBuffer);
-
-      try {
-        const result = await transcribeWithScribe({
-          filePath: tempFile,
-          apiKey: elevenLabsKey,
-          languageCode: language || "auto",
-        });
-
-        // Convert to Whisper-compatible format (same as /transcribe-elevenlabs)
-        const allWords = result.segments.flatMap(
-          (seg) =>
-            seg.words?.map((w) => ({
-              word: w.text,
-              start: w.start,
-              end: w.end,
-            })) || []
+      // Helper to process transcription (used for both sync and async modes)
+      const processTranscription = async () => {
+        // Fetch the file from R2 with timeout
+        const abortController = new AbortController();
+        const timeoutId = setTimeout(
+          () => abortController.abort(),
+          R2_FETCH_TIMEOUT_MS
         );
 
-        // Calculate duration from segments
-        const duration =
-          result.segments.length > 0
-            ? result.segments[result.segments.length - 1].end
-            : 0;
-
-        const whisperFormat = {
-          text: result.text,
-          language: result.language_code,
-          segments: result.segments.map((seg, idx) => ({
-            id: idx,
-            start: seg.start,
-            end: seg.end,
-            text: seg.text,
-            words: seg.words?.map((w) => ({
-              word: w.text,
-              start: w.start,
-              end: w.end,
-            })),
-          })),
-          words: allWords,
-          duration,
-          approx_duration: duration,
-        };
-
-        console.log(`🎯 ElevenLabs Scribe (R2) completed! Duration: ${duration.toFixed(1)}s`);
-        sendJson(res, whisperFormat);
-      } finally {
-        // Cleanup temp file
+        let r2Response: Response;
         try {
-          await fs.promises.unlink(tempFile);
-        } catch (cleanupErr: any) {
-          console.warn(`⚠️ Failed to cleanup temp file ${tempFile}:`, cleanupErr.message);
+          r2Response = await fetch(r2Url, { signal: abortController.signal });
+        } finally {
+          clearTimeout(timeoutId);
         }
+
+        if (!r2Response.ok) {
+          throw new Error(`Failed to fetch from R2: ${r2Response.status}`);
+        }
+
+        const audioBuffer = Buffer.from(await r2Response.arrayBuffer());
+        const fileSizeMB = audioBuffer.length / (1024 * 1024);
+
+        console.log(
+          `🎵 Transcribing with ElevenLabs Scribe (${fileSizeMB.toFixed(
+            1
+          )}MB from R2)`
+        );
+
+        // Write to temp file for ElevenLabs
+        const fs = await import("fs");
+        const os = await import("os");
+        const path = await import("path");
+        const tempFile = path.join(os.tmpdir(), `r2-audio-${Date.now()}.webm`);
+        await fs.promises.writeFile(tempFile, audioBuffer);
+
+        try {
+          const result = await transcribeWithScribe({
+            filePath: tempFile,
+            apiKey: elevenLabsKey,
+            languageCode: language || "auto",
+          });
+
+          // Convert to Whisper-compatible format (same as /transcribe-elevenlabs)
+          const allWords = result.segments.flatMap(
+            (seg) =>
+              seg.words?.map((w) => ({
+                word: w.text,
+                start: w.start,
+                end: w.end,
+              })) || []
+          );
+
+          // Calculate duration from segments
+          const duration =
+            result.segments.length > 0
+              ? result.segments[result.segments.length - 1].end
+              : 0;
+
+          const whisperFormat = {
+            text: result.text,
+            language: result.language_code,
+            segments: result.segments.map((seg, idx) => ({
+              id: idx,
+              start: seg.start,
+              end: seg.end,
+              text: seg.text,
+              words: seg.words?.map((w) => ({
+                word: w.text,
+                start: w.start,
+                end: w.end,
+              })),
+            })),
+            words: allWords,
+            duration,
+            approx_duration: duration,
+          };
+
+          console.log(
+            `🎯 ElevenLabs Scribe (R2) completed! Duration: ${duration.toFixed(
+              1
+            )}s`
+          );
+          return { success: true, result: whisperFormat };
+        } finally {
+          // Cleanup temp file
+          try {
+            await fs.promises.unlink(tempFile);
+          } catch (cleanupErr: any) {
+            console.warn(
+              `⚠️ Failed to cleanup temp file ${tempFile}:`,
+              cleanupErr.message
+            );
+          }
+        }
+      };
+
+      // If webhook URL provided, process async and return immediately
+      if (webhookUrl) {
+        console.log(`📞 Webhook mode: will POST result to ${webhookUrl}`);
+        sendJson(res, {
+          status: "processing",
+          message: "Transcription started, result will be sent to webhook",
+        });
+
+        // Process in background and call webhook when done
+        processTranscription()
+          .then(async ({ result }) => {
+            try {
+              console.log(`📞 Calling webhook: ${webhookUrl}`);
+              const webhookRes = await fetch(webhookUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Relay-Secret": relaySecret,
+                },
+                body: JSON.stringify({ success: true, result }),
+              });
+              if (webhookRes.ok) {
+                console.log(`✅ Webhook callback successful`);
+              } else {
+                console.error(
+                  `❌ Webhook callback failed: ${webhookRes.status}`
+                );
+              }
+            } catch (webhookErr: any) {
+              console.error(`❌ Webhook callback error:`, webhookErr.message);
+            }
+          })
+          .catch(async (error: any) => {
+            console.error(
+              `❌ Transcription failed, notifying webhook:`,
+              error.message
+            );
+            try {
+              await fetch(webhookUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "X-Relay-Secret": relaySecret,
+                },
+                body: JSON.stringify({ success: false, error: error.message }),
+              });
+            } catch (webhookErr: any) {
+              console.error(
+                `❌ Webhook error callback failed:`,
+                webhookErr.message
+              );
+            }
+          });
+        return;
       }
+
+      // Synchronous mode (no webhook) - original behavior
+      const { result } = await processTranscription();
+      sendJson(res, result);
     } catch (error: any) {
       console.error("❌ ElevenLabs Scribe (R2) error:", error.message);
       sendError(res, 500, "Transcription from R2 failed", error.message);
@@ -884,7 +1615,8 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey =
+      getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
       sendError(res, 500, "ElevenLabs not configured");
@@ -903,7 +1635,8 @@ const server = createServer(async (req, res) => {
                 ? Number(segment.index)
                 : idx + 1;
               const targetDuration =
-                typeof segment?.targetDuration === "number" && Number.isFinite(segment.targetDuration)
+                typeof segment?.targetDuration === "number" &&
+                Number.isFinite(segment.targetDuration)
                   ? segment.targetDuration
                   : undefined;
               return { index, text, targetDuration };
@@ -952,7 +1685,10 @@ const server = createServer(async (req, res) => {
         );
         segmentResponses.push(...results);
         console.log(
-          `   • Completed ${Math.min(i + CONCURRENCY, segmentsPayload.length)}/${segmentsPayload.length} segments`
+          `   • Completed ${Math.min(
+            i + CONCURRENCY,
+            segmentsPayload.length
+          )}/${segmentsPayload.length} segments`
         );
       }
 
@@ -977,12 +1713,15 @@ const server = createServer(async (req, res) => {
     console.log("🎬 Processing ElevenLabs video dubbing request...");
 
     if (!validateRelaySecret(req)) {
-      console.log("❌ Invalid or missing relay secret for /dub-video-elevenlabs");
+      console.log(
+        "❌ Invalid or missing relay secret for /dub-video-elevenlabs"
+      );
       sendError(res, 401, "Unauthorized - invalid relay secret");
       return;
     }
 
-    const elevenLabsKey = getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey =
+      getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
       console.log("❌ ElevenLabs API key not provided");
       sendError(res, 500, "ElevenLabs not configured");
@@ -1018,10 +1757,15 @@ const server = createServer(async (req, res) => {
         ? fields.num_speakers[0]
         : fields.num_speakers;
       // Safe parseInt with Number.isFinite validation
-      const numSpeakersRaw = numSpeakersField ? parseInt(numSpeakersField, 10) : undefined;
-      const numSpeakers = numSpeakersRaw !== undefined && Number.isFinite(numSpeakersRaw) && numSpeakersRaw > 0
-        ? numSpeakersRaw
+      const numSpeakersRaw = numSpeakersField
+        ? parseInt(numSpeakersField, 10)
         : undefined;
+      const numSpeakers =
+        numSpeakersRaw !== undefined &&
+        Number.isFinite(numSpeakersRaw) &&
+        numSpeakersRaw > 0
+          ? numSpeakersRaw
+          : undefined;
       const dropBackgroundAudioField = Array.isArray(
         fields.drop_background_audio
       )
@@ -1030,7 +1774,11 @@ const server = createServer(async (req, res) => {
       const dropBackgroundAudio = dropBackgroundAudioField !== "false";
 
       console.log(
-        `🎬 Dubbing video: ${file.originalFilename} (${(file.size / 1024 / 1024).toFixed(1)}MB) → ${targetLanguage}`
+        `🎬 Dubbing video: ${file.originalFilename} (${(
+          file.size /
+          1024 /
+          1024
+        ).toFixed(1)}MB) → ${targetLanguage}`
       );
 
       const fs = await import("fs");
@@ -1109,7 +1857,12 @@ const server = createServer(async (req, res) => {
       }
 
       if (!payload) {
-        sendError(res, 400, "Invalid translation payload", "Expected messages[] or text/target_language");
+        sendError(
+          res,
+          400,
+          "Invalid translation payload",
+          "Expected messages[] or text/target_language"
+        );
         return;
       }
 
@@ -1191,7 +1944,12 @@ const server = createServer(async (req, res) => {
     if (job.status === "completed") {
       sendJson(res, job.result ?? {});
     } else if (job.status === "failed") {
-      sendError(res, 500, job.error?.message || "Translation failed", job.error?.details);
+      sendError(
+        res,
+        500,
+        job.error?.message || "Translation failed",
+        job.error?.details
+      );
     } else {
       res.writeHead(202, {
         "Content-Type": "application/json",
@@ -1289,7 +2047,12 @@ const server = createServer(async (req, res) => {
 
       if (segmentsPayload.length > 0) {
         if (segmentsPayload.length > DUB_MAX_SEGMENTS) {
-          sendError(res, 413, "Dub request too large", `Received ${segmentsPayload.length} segments, limit is ${DUB_MAX_SEGMENTS}`);
+          sendError(
+            res,
+            413,
+            "Dub request too large",
+            `Received ${segmentsPayload.length} segments, limit is ${DUB_MAX_SEGMENTS}`
+          );
           return;
         }
 
@@ -1299,7 +2062,12 @@ const server = createServer(async (req, res) => {
         );
 
         if (totalCharacters > DUB_MAX_TOTAL_CHARACTERS) {
-          sendError(res, 413, "Dub request too large", `Received ${totalCharacters} characters, limit is ${DUB_MAX_TOTAL_CHARACTERS}`);
+          sendError(
+            res,
+            413,
+            "Dub request too large",
+            `Received ${totalCharacters} characters, limit is ${DUB_MAX_TOTAL_CHARACTERS}`
+          );
           return;
         }
 
@@ -1433,7 +2201,12 @@ const server = createServer(async (req, res) => {
 
           const details = segmentError?.response?.data ?? segmentError?.message;
           console.error("❌ Relay segment synthesis failed:", details);
-          sendError(res, 500, "Dub synthesis failed", typeof details === "string" ? details : JSON.stringify(details));
+          sendError(
+            res,
+            500,
+            "Dub synthesis failed",
+            typeof details === "string" ? details : JSON.stringify(details)
+          );
           return;
         }
 
@@ -1508,7 +2281,12 @@ const server = createServer(async (req, res) => {
       return;
     } catch (error: any) {
       console.error("❌ Relay dub synthesis error:", error?.message || error);
-      sendError(res, 500, "Dub synthesis failed", error?.message || String(error));
+      sendError(
+        res,
+        500,
+        "Dub synthesis failed",
+        error?.message || String(error)
+      );
       return;
     }
   }
