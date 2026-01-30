@@ -40,10 +40,12 @@ export async function transcribeWithScribe({
   filePath,
   apiKey,
   languageCode = "auto",
+  idempotencyKey,
 }: {
   filePath: string;
   apiKey: string;
   languageCode?: string;
+  idempotencyKey?: string;
 }): Promise<ScribeResult> {
   const fileBuffer = await fs.readFile(filePath);
   const fileName = filePath.split("/").pop() || "audio.webm";
@@ -66,6 +68,7 @@ export async function transcribeWithScribe({
     method: "POST",
     headers: {
       "xi-api-key": apiKey,
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
     body: formData,
   });

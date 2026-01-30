@@ -506,7 +506,7 @@ const server = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Relay-Secret, X-OpenAI-Key, X-Anthropic-Key, X-ElevenLabs-Key"
+    "Content-Type, Authorization, Idempotency-Key, X-Idempotency-Key, X-Relay-Secret, X-OpenAI-Key, X-Anthropic-Key, X-ElevenLabs-Key"
   );
   if (corsOrigin !== "*") {
     res.setHeader("Vary", "Origin");
@@ -709,6 +709,9 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const idempotencyKey =
+      getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
+
     const elevenLabsKey =
       getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
@@ -746,6 +749,7 @@ const server = createServer(async (req, res) => {
         filePath: file.filepath,
         apiKey: elevenLabsKey,
         languageCode: language || "auto",
+        idempotencyKey,
       });
 
       // Convert to Whisper-compatible format
@@ -795,6 +799,10 @@ const server = createServer(async (req, res) => {
       sendError(res, 401, "Unauthorized - missing API key");
       return;
     }
+
+    // Stable idempotency key from the app to prevent double billing on retries.
+    const idempotencyKey =
+      getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
 
     const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
@@ -875,6 +883,7 @@ const server = createServer(async (req, res) => {
         filePath: file.filepath,
         apiKey: elevenLabsKey,
         languageCode: language || "auto",
+        idempotencyKey,
       });
 
       // Convert to Whisper-compatible format
@@ -927,6 +936,7 @@ const server = createServer(async (req, res) => {
           body: JSON.stringify({
             deviceId,
             durationSeconds: duration,
+            ...(idempotencyKey ? { idempotencyKey } : {}),
           }),
         });
 
@@ -1407,6 +1417,9 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const idempotencyKey =
+      getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
+
     const elevenLabsKey =
       getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
     if (!elevenLabsKey) {
@@ -1482,6 +1495,7 @@ const server = createServer(async (req, res) => {
             filePath: tempFile,
             apiKey: elevenLabsKey,
             languageCode: language || "auto",
+            idempotencyKey,
           });
 
           // Convert to Whisper-compatible format (same as /transcribe-elevenlabs)
