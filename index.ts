@@ -752,10 +752,20 @@ const server = createServer(async (req, res) => {
         idempotencyKey,
       });
 
+      // ElevenLabs Scribe doesn't return an explicit duration field in our wrapper.
+      // Compute an approximate duration from the max segment end so upstream billing
+      // (stage5-api) can reliably deduct credits.
+      const duration =
+        result.segments.length > 0
+          ? Math.max(...result.segments.map((s) => s.end || 0))
+          : 0;
+
       // Convert to Whisper-compatible format
       const whisperFormat = {
         text: result.text,
         language: result.language_code,
+        duration,
+        approx_duration: duration,
         segments: result.segments.map((seg, idx) => ({
           id: idx,
           start: seg.start,
@@ -948,22 +958,28 @@ const server = createServer(async (req, res) => {
             `❌ Credit deduction failed: ${deductRes.status}`,
             deductErr
           );
-          // Still return the result - we don't want to lose the transcription
-          // Log for manual reconciliation
-          console.error(
-            `⚠️ RECONCILIATION NEEDED: device=${deviceId} duration=${duration}s`
+          const status = deductRes.status === 402 ? 402 : 500;
+          sendError(
+            res,
+            status,
+            (deductErr as any).error || "Credit deduction failed"
           );
-        } else {
-          console.log(`✅ Credits deducted successfully`);
+          return;
         }
+
+        console.log(`✅ Credits deducted successfully`);
       } catch (deductErr: any) {
         console.error("❌ Credit deduction request failed:", deductErr.message);
-        console.error(
-          `⚠️ RECONCILIATION NEEDED: device=${deviceId} duration=${duration}s`
+        sendError(
+          res,
+          500,
+          "Credit deduction failed",
+          deductErr?.message
         );
+        return;
       }
 
-      // Return result to app
+      // Return result to app (only after successful deduction)
       sendJson(res, whisperFormat);
     } catch (error: any) {
       console.error("❌ Transcription error:", error.message);
@@ -1120,21 +1136,35 @@ const server = createServer(async (req, res) => {
         });
 
         if (!deductRes.ok) {
-          console.error(`❌ Credit deduction failed: ${deductRes.status}`);
+          const deductErr = await deductRes
+            .json()
+            .catch(() => ({ error: "Deduction failed" }));
           console.error(
-            `⚠️ RECONCILIATION NEEDED: device=${deviceId} tokens=${promptTokens}+${completionTokens}`
+            `❌ Credit deduction failed: ${deductRes.status}`,
+            deductErr
           );
-        } else {
-          console.log(`✅ Credits deducted successfully`);
+          const status = deductRes.status === 402 ? 402 : 500;
+          sendError(
+            res,
+            status,
+            (deductErr as any).error || "Credit deduction failed"
+          );
+          return;
         }
+
+        console.log(`✅ Credits deducted successfully`);
       } catch (deductErr: any) {
         console.error("❌ Credit deduction request failed:", deductErr.message);
-        console.error(
-          `⚠️ RECONCILIATION NEEDED: device=${deviceId} tokens=${promptTokens}+${completionTokens}`
+        sendError(
+          res,
+          500,
+          "Credit deduction failed",
+          deductErr?.message
         );
+        return;
       }
 
-      // Return result to app
+      // Return result to app (only after successful deduction)
       sendJson(res, result);
     } catch (error: any) {
       console.error("❌ Translation error:", error.message);
@@ -1383,21 +1413,35 @@ const server = createServer(async (req, res) => {
         });
 
         if (!deductRes.ok) {
-          console.error(`❌ Credit deduction failed: ${deductRes.status}`);
+          const deductErr = await deductRes
+            .json()
+            .catch(() => ({ error: "Deduction failed" }));
           console.error(
-            `⚠️ RECONCILIATION NEEDED: device=${deviceId} chars=${totalCharacters}`
+            `❌ Credit deduction failed: ${deductRes.status}`,
+            deductErr
           );
-        } else {
-          console.log(`✅ Credits deducted successfully`);
+          const status = deductRes.status === 402 ? 402 : 500;
+          sendError(
+            res,
+            status,
+            (deductErr as any).error || "Credit deduction failed"
+          );
+          return;
         }
+
+        console.log(`✅ Credits deducted successfully`);
       } catch (deductErr: any) {
         console.error("❌ Credit deduction request failed:", deductErr.message);
-        console.error(
-          `⚠️ RECONCILIATION NEEDED: device=${deviceId} chars=${totalCharacters}`
+        sendError(
+          res,
+          500,
+          "Credit deduction failed",
+          deductErr?.message
         );
+        return;
       }
 
-      // Return result to app
+      // Return result to app (only after successful deduction)
       sendJson(res, result);
     } catch (error: any) {
       console.error("❌ Dub error:", error.message);
