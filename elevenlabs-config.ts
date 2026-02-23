@@ -56,7 +56,7 @@ export async function transcribeWithScribe({
     new Blob([new Uint8Array(fileBuffer)], { type: "audio/webm" }),
     fileName
   );
-  formData.append("model_id", "scribe_v1");
+  formData.append("model_id", "scribe_v2");
   if (languageCode && languageCode !== "auto") {
     formData.append("language_code", languageCode);
   }
