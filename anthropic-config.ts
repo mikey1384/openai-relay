@@ -40,6 +40,7 @@ export async function translateWithClaude({
   maxTokens = MAX_TOKENS_DEFAULT,
   effort,
 }: ClaudeTranslateOptions): Promise<{
+  model: string;
   choices: Array<{ message: { role: string; content: string } }>;
   usage: { prompt_tokens: number; completion_tokens: number };
 }> {
@@ -105,6 +106,7 @@ export async function translateWithClaude({
   }
 
   return {
+    model,
     choices: [
       {
         message: {

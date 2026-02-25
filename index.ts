@@ -4,7 +4,13 @@ import { IncomingForm } from "formidable";
 import { randomUUID } from "node:crypto";
 import { makeOpenAI } from "./openai-config.js";
 import { translateWithClaude } from "./anthropic-config.js";
-import { DEFAULT_TRANSLATION_MODEL, isClaudeModel } from "./constants.js";
+import {
+  CLAUDE_OPUS_MODEL,
+  DEFAULT_TRANSLATION_MODEL,
+  isAllowedStage5TranslationModel,
+  isClaudeModel,
+  normalizeModelId,
+} from "./constants.js";
 import {
   transcribeWithScribe,
   synthesizeWithElevenLabs,
@@ -42,6 +48,27 @@ const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB limit for request bodies
 const MAX_TRANSLATION_JOBS = 1000; // Memory leak prevention
 const JOB_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes (reduced from 1 hour)
 const R2_FETCH_TIMEOUT_MS = 120_000; // 2 minute timeout for R2 fetches
+const WHISPER_TRANSCRIPTION_MODEL = "whisper-1";
+const ELEVENLABS_TRANSCRIPTION_MODEL = "elevenlabs-scribe";
+const WHISPER_MAX_FILE_SIZE_BYTES = Math.max(
+  1,
+  Number.parseInt(
+    process.env.WHISPER_MAX_FILE_SIZE_BYTES || String(25 * 1024 * 1024),
+    10
+  )
+);
+const SCRIBE_MAX_RETRIES = Math.max(
+  1,
+  Number.parseInt(process.env.SCRIBE_MAX_RETRIES || "3", 10)
+);
+const SCRIBE_RETRY_BASE_DELAY_MS = Math.max(
+  100,
+  Number.parseInt(process.env.SCRIBE_RETRY_BASE_DELAY_MS || "600", 10)
+);
+const SCRIBE_RETRY_MAX_DELAY_MS = Math.max(
+  SCRIBE_RETRY_BASE_DELAY_MS,
+  Number.parseInt(process.env.SCRIBE_RETRY_MAX_DELAY_MS || "4000", 10)
+);
 
 // Fail fast if RELAY_SECRET is missing - this is critical for security
 const RELAY_SECRET = process.env.RELAY_SECRET;
@@ -61,12 +88,16 @@ const ALLOWED_R2_HOSTS = process.env.ALLOWED_R2_HOSTS
   : [];
 
 type TranslationJobStatus = "queued" | "processing" | "completed" | "failed";
+type TranslationModelFamily = "gpt" | "claude" | "auto";
 
 type ChatJobPayload = {
   mode: "chat";
   messages: Array<{ role: string; content: string }>;
   model: string;
+  modelFamily?: TranslationModelFamily;
   reasoning?: any;
+  translationPhase?: "draft" | "review";
+  qualityMode?: boolean;
 };
 
 type TextJobPayload = {
@@ -194,6 +225,294 @@ function getCorsOrigin(req: IncomingMessage): string {
 
   // Default to first allowed origin
   return ALLOWED_ORIGINS[0] || "*";
+}
+
+function isLikelySubtitleReviewMessages(
+  messages: Array<{ role: string; content: string }> | undefined
+): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const systemText = messages
+    .filter((m) => String(m?.role ?? "").toLowerCase() === "system")
+    .map((m) => String(m?.content ?? ""))
+    .join("\n")
+    .toLowerCase();
+
+  if (!systemText) return false;
+
+  // Tight signature for subtitle review system prompt to avoid false positives.
+  return (
+    systemText.includes("subtitle reviewer.") &&
+    systemText.includes("output exactly") &&
+    systemText.includes("@@sub_line@@") &&
+    systemText.includes("no commentary.")
+  );
+}
+
+function isLikelySubtitleDraftMessages(
+  messages: Array<{ role: string; content: string }> | undefined
+): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const systemText = messages
+    .filter((m) => String(m?.role ?? "").toLowerCase() === "system")
+    .map((m) => String(m?.content ?? ""))
+    .join("\n")
+    .toLowerCase();
+
+  if (!systemText) return false;
+
+  return (
+    systemText.includes("subtitle translator.") &&
+    systemText.includes("output exactly") &&
+    systemText.includes("@@sub_line@@")
+  );
+}
+
+function parseTranslationPhase(raw: unknown): "draft" | "review" | undefined {
+  const phase =
+    typeof raw === "string" ? raw.trim().toLowerCase() : undefined;
+  if (phase === "draft" || phase === "review") {
+    return phase;
+  }
+  return undefined;
+}
+
+function parseTranslationModelFamily(
+  raw: unknown
+): TranslationModelFamily | undefined {
+  const family =
+    typeof raw === "string" ? raw.trim().toLowerCase() : undefined;
+  if (family === "gpt" || family === "claude" || family === "auto") {
+    return family;
+  }
+  if (family === "openai") return "gpt";
+  if (family === "anthropic") return "claude";
+  return undefined;
+}
+
+function parseBooleanLike(raw: unknown): boolean | undefined {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw !== "string") return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (["1", "true", "yes", "on", "high", "quality"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off", "low", "standard"].includes(normalized)) {
+    return false;
+  }
+  return undefined;
+}
+
+function resolveDirectTranscriptionQuality({
+  explicitQualityRaw,
+  modelHint,
+  modelIdHint,
+}: {
+  explicitQualityRaw: unknown;
+  modelHint?: string;
+  modelIdHint?: string;
+}): {
+  useHighQuality: boolean;
+  source: "explicit" | "model-hint" | "default";
+} {
+  const explicit = parseBooleanLike(explicitQualityRaw);
+  if (typeof explicit === "boolean") {
+    return { useHighQuality: explicit, source: "explicit" };
+  }
+
+  const combinedHints = [modelHint, modelIdHint]
+    .map((v) => (typeof v === "string" ? v.trim().toLowerCase() : ""))
+    .filter(Boolean)
+    .join(" ");
+  const hintTokens = combinedHints.split(/[^a-z0-9]+/).filter(Boolean);
+  if (hintTokens.includes("whisper")) {
+    return { useHighQuality: false, source: "model-hint" };
+  }
+  if (hintTokens.includes("scribe") || hintTokens.includes("elevenlabs")) {
+    return { useHighQuality: true, source: "model-hint" };
+  }
+
+  return { useHighQuality: true, source: "default" };
+}
+
+function formatSizeMB(bytes: number): string {
+  return (bytes / (1024 * 1024)).toFixed(1);
+}
+
+function getWhisperFileSizeGuardMessage(fileSizeBytes: number): string | null {
+  if (!Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0) return null;
+  if (fileSizeBytes <= WHISPER_MAX_FILE_SIZE_BYTES) return null;
+  return `File is ${formatSizeMB(fileSizeBytes)}MB; Whisper supports up to ${formatSizeMB(WHISPER_MAX_FILE_SIZE_BYTES)}MB per request.`;
+}
+
+function toWhisperCompatibleScribeResult(result: any) {
+  const segments = Array.isArray(result?.segments) ? result.segments : [];
+  const duration =
+    segments.length > 0
+      ? Math.max(
+          ...segments.map((segment: any) =>
+            Number.isFinite(segment?.end) ? segment.end : 0
+          )
+        )
+      : 0;
+
+  return {
+    text: String(result?.text ?? ""),
+    language: typeof result?.language_code === "string" ? result.language_code : undefined,
+    duration,
+    approx_duration: duration,
+    model: ELEVENLABS_TRANSCRIPTION_MODEL,
+    segments: segments.map((segment: any, idx: number) => ({
+      id: idx,
+      start: Number.isFinite(segment?.start) ? segment.start : 0,
+      end: Number.isFinite(segment?.end) ? segment.end : 0,
+      text: String(segment?.text ?? ""),
+      words: Array.isArray(segment?.words)
+        ? segment.words.map((word: any) => ({
+            word: String(word?.text ?? ""),
+            start: Number.isFinite(word?.start) ? word.start : 0,
+            end: Number.isFinite(word?.end) ? word.end : 0,
+          }))
+        : [],
+    })),
+    words: segments.flatMap((segment: any) =>
+      Array.isArray(segment?.words)
+        ? segment.words.map((word: any) => ({
+            word: String(word?.text ?? ""),
+            start: Number.isFinite(word?.start) ? word.start : 0,
+            end: Number.isFinite(word?.end) ? word.end : 0,
+          }))
+        : []
+    ),
+  };
+}
+
+async function transcribeWithWhisperFromPath({
+  openaiKey,
+  filePath,
+  fileName,
+  mimeType,
+  language,
+  prompt,
+}: {
+  openaiKey: string;
+  filePath: string;
+  fileName: string;
+  mimeType: string;
+  language?: string;
+  prompt?: string;
+}) {
+  const client = makeOpenAI(openaiKey);
+  const fs = await import("fs");
+  const fileBuffer = await fs.promises.readFile(filePath);
+  const fileBlob = new File([fileBuffer as unknown as BlobPart], fileName, {
+    type: mimeType,
+  });
+
+  const whisperResult = (await client.audio.transcriptions.create({
+    file: fileBlob,
+    model: WHISPER_TRANSCRIPTION_MODEL,
+    language: language || undefined,
+    prompt: prompt || undefined,
+    response_format: "verbose_json",
+    timestamp_granularities: ["word", "segment"],
+  })) as any;
+
+  const durationFromSegments =
+    Array.isArray(whisperResult?.segments) && whisperResult.segments.length > 0
+      ? Math.max(
+          ...whisperResult.segments.map((segment: any) =>
+            Number.isFinite(segment?.end) ? segment.end : 0
+          )
+        )
+      : 0;
+  const duration =
+    Number.isFinite(whisperResult?.duration) && whisperResult.duration > 0
+      ? whisperResult.duration
+      : durationFromSegments;
+
+  return {
+    ...whisperResult,
+    model: WHISPER_TRANSCRIPTION_MODEL,
+    duration,
+    approx_duration:
+      Number.isFinite(whisperResult?.approx_duration) &&
+      whisperResult.approx_duration > 0
+        ? whisperResult.approx_duration
+        : duration,
+  };
+}
+
+function resolveTranslationModel({
+  rawModel,
+  modelFamily,
+  messages,
+  canUseAnthropic,
+  translationPhase,
+  qualityMode,
+}: {
+  rawModel?: string;
+  modelFamily?: TranslationModelFamily;
+  messages?: Array<{ role: string; content: string }>;
+  canUseAnthropic: boolean;
+  translationPhase?: "draft" | "review";
+  qualityMode?: boolean;
+}): string {
+  const normalized = normalizeModelId(rawModel || DEFAULT_TRANSLATION_MODEL);
+  const requestedFamily =
+    modelFamily && modelFamily !== "auto" ? modelFamily : undefined;
+  const reviewByHeuristic = isLikelySubtitleReviewMessages(messages);
+  const draftByHeuristic = isLikelySubtitleDraftMessages(messages);
+  const isSubtitleWorkflow =
+    translationPhase === "review" ||
+    translationPhase === "draft" ||
+    reviewByHeuristic ||
+    draftByHeuristic;
+
+  // Non-subtitle traffic keeps caller-selected model (e.g. summarization flows).
+  if (!isSubtitleWorkflow) {
+    return normalized;
+  }
+
+  const effectivePhase =
+    translationPhase === "review"
+      ? "review"
+      : translationPhase === "draft"
+        ? "draft"
+        : qualityMode === false
+          ? "draft"
+          : reviewByHeuristic
+            ? "review"
+            : "draft";
+
+  // Subtitle workflow in Stage5 credit mode is backend-authoritative:
+  // - review => explicit model-family intent (gpt/claude), with Anthropic-aware fallback
+  // - review (no family intent) => auto (Claude Opus when available, else GPT)
+  // - draft => GPT
+  const selectedModel =
+    effectivePhase === "review"
+      ? requestedFamily === "gpt"
+        ? DEFAULT_TRANSLATION_MODEL
+        : requestedFamily === "claude"
+          ? canUseAnthropic
+            ? CLAUDE_OPUS_MODEL
+            : DEFAULT_TRANSLATION_MODEL
+          : canUseAnthropic
+            ? CLAUDE_OPUS_MODEL
+            : DEFAULT_TRANSLATION_MODEL
+      : DEFAULT_TRANSLATION_MODEL;
+
+  if (selectedModel !== normalized) {
+    console.log(
+      `🧭 Server model authority selected ${selectedModel} (requested=${normalized}, phase=${
+        translationPhase ?? effectivePhase
+      }, modelFamily=${modelFamily ?? "auto"}, qualityMode=${
+        typeof qualityMode === "boolean" ? qualityMode : "auto"
+      })`
+    );
+  }
+
+  return selectedModel;
 }
 
 function readJsonBody(req: any): Promise<any> {
@@ -366,13 +685,84 @@ function shouldRetrySegmentError(error: any): boolean {
   return status == null;
 }
 
+async function transcribeWithScribeWithRetries({
+  filePath,
+  apiKey,
+  languageCode,
+  idempotencyKey,
+  contextLabel,
+}: {
+  filePath: string;
+  apiKey: string;
+  languageCode: string;
+  idempotencyKey?: string;
+  contextLabel: string;
+}): Promise<{ result: Awaited<ReturnType<typeof transcribeWithScribe>>; attempts: number }> {
+  let lastError: any = null;
+  let attempts = 0;
+
+  for (let attempt = 1; attempt <= SCRIBE_MAX_RETRIES; attempt += 1) {
+    attempts = attempt;
+    try {
+      const result = await transcribeWithScribe({
+        filePath,
+        apiKey,
+        languageCode,
+        idempotencyKey,
+      });
+      return { result, attempts };
+    } catch (error: any) {
+      lastError = error;
+      const retryable = shouldRetrySegmentError(error);
+      if (!retryable || attempt >= SCRIBE_MAX_RETRIES) {
+        break;
+      }
+
+      const delay = Math.min(
+        SCRIBE_RETRY_MAX_DELAY_MS,
+        SCRIBE_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+      );
+      console.warn(
+        `⚠️ ${contextLabel} ElevenLabs Scribe attempt ${attempt}/${SCRIBE_MAX_RETRIES} failed, retrying in ${delay}ms: ${
+          error?.message || String(error)
+        }`
+      );
+      await sleep(delay);
+    }
+  }
+
+  if (lastError && typeof lastError === "object") {
+    (lastError as any).scribeAttempts = attempts;
+  }
+  throw (
+    lastError ||
+    new Error(`${contextLabel} ElevenLabs Scribe failed without a response`)
+  );
+}
+
 async function processTranslationJob(job: TranslationJob): Promise<void> {
   job.status = "processing";
   job.updatedAt = Date.now();
 
   try {
     const payload = job.payload;
-    const model = payload.model || DEFAULT_TRANSLATION_MODEL;
+    const model =
+      payload.mode === "chat"
+        ? resolveTranslationModel({
+            rawModel: payload.model,
+            modelFamily: payload.modelFamily,
+            messages: payload.messages,
+            canUseAnthropic: Boolean(
+              job.anthropicKey || process.env.ANTHROPIC_API_KEY
+            ),
+            translationPhase: payload.translationPhase,
+            qualityMode: payload.qualityMode,
+          })
+        : normalizeModelId(payload.model || DEFAULT_TRANSLATION_MODEL);
+
+    if (!isAllowedStage5TranslationModel(model)) {
+      throw new Error(`Unsupported translation model: ${model}`);
+    }
 
     // Route to Claude for Claude models
     if (isClaudeModel(model)) {
@@ -455,7 +845,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
         }
       }
 
-      job.result = completion;
+      job.result = { ...completion, model };
     } else {
       const { text, target_language } = payload;
 
@@ -474,7 +864,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
       };
 
       const completion = await client.chat.completions.create(request);
-      job.result = completion;
+      job.result = { ...completion, model };
     }
 
     console.log(`🎯 Translation completed using OpenAI (model=${model})`);
@@ -627,6 +1017,9 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const idempotencyKey =
+      getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
+
     console.log("🎯 Relay secret validated, processing transcription...");
 
     try {
@@ -641,56 +1034,151 @@ const server = createServer(async (req, res) => {
         sendError(res, 400, "No file provided");
         return;
       }
+      const whisperSizeGuardMessage = getWhisperFileSizeGuardMessage(file.size);
 
-      const model = Array.isArray(fields.model)
+      const modelHint = Array.isArray(fields.model)
         ? fields.model[0]
-        : fields.model || "whisper-1";
+        : fields.model;
+      const modelIdHint = Array.isArray(fields.model_id)
+        ? fields.model_id[0]
+        : fields.model_id;
+      const qualityModeRaw =
+        (Array.isArray(fields.qualityMode)
+          ? fields.qualityMode[0]
+          : fields.qualityMode) ??
+        (Array.isArray(fields.quality_mode)
+          ? fields.quality_mode[0]
+          : fields.quality_mode);
       const language = Array.isArray(fields.language)
         ? fields.language[0]
         : fields.language;
       const prompt = Array.isArray(fields.prompt)
         ? fields.prompt[0]
         : fields.prompt;
+      const { useHighQuality, source: qualitySource } =
+        resolveDirectTranscriptionQuality({
+          explicitQualityRaw: qualityModeRaw,
+          modelHint: typeof modelHint === "string" ? modelHint : undefined,
+          modelIdHint: typeof modelIdHint === "string" ? modelIdHint : undefined,
+        });
 
       console.log(
-        `🎵 Transcribing file: ${file.originalFilename} (${(
+        `🎵 /transcribe selected ${
+          useHighQuality ? "elevenlabs" : "whisper"
+        } (qualitySource=${qualitySource}) for ${file.originalFilename} (${(
           file.size /
           1024 /
           1024
-        ).toFixed(1)}MB) with model: ${model}`
+        ).toFixed(1)}MB)`
       );
 
       const openaiKey = getHeader(req, "x-openai-key");
-      if (!openaiKey) {
-        console.log("❌ Missing OpenAI API key");
-        sendError(res, 401, "Unauthorized - missing OpenAI key");
-        return;
+      const elevenLabsKey =
+        getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+
+      let effectiveHighQuality = useHighQuality;
+      if (effectiveHighQuality && !elevenLabsKey && openaiKey) {
+        effectiveHighQuality = false;
+        console.warn(
+          "⚠️ ElevenLabs key missing for high-quality /transcribe; falling back to Whisper."
+        );
       }
-      const client = makeOpenAI(openaiKey);
 
-      const fs = await import("fs");
-      const fileBuffer = await fs.promises.readFile(file.filepath);
-      const fileBlob = new File(
-        [fileBuffer as unknown as BlobPart],
-        file.originalFilename || "audio.webm",
-        {
-          type: file.mimetype || "audio/webm",
+      if (effectiveHighQuality) {
+        if (!elevenLabsKey) {
+          sendError(res, 500, "ElevenLabs not configured");
+          return;
         }
-      );
 
-      const transcription = await client.audio.transcriptions.create({
-        file: fileBlob,
-        model: model,
-        language: language || undefined,
-        prompt: prompt || undefined,
-        response_format: "verbose_json",
-        timestamp_granularities: ["word", "segment"],
-      });
+        try {
+          const { result: scribeResult, attempts } =
+            await transcribeWithScribeWithRetries({
+              filePath: file.filepath,
+              apiKey: elevenLabsKey,
+              languageCode: language || "auto",
+              idempotencyKey,
+              contextLabel: "/transcribe",
+            });
+          const whisperFormat = toWhisperCompatibleScribeResult(scribeResult);
+          if (attempts > 1) {
+            (whisperFormat as any).retry = {
+              provider: ELEVENLABS_TRANSCRIPTION_MODEL,
+              attempts,
+            };
+          }
 
-      console.log(
-        `🎯 Relay transcription completed successfully using OpenAI!`
-      );
-      sendJson(res, transcription);
+          console.log("🎯 Relay transcription completed with ElevenLabs.");
+          sendJson(res, whisperFormat);
+        } catch (scribeError: any) {
+          if (!openaiKey) {
+            throw scribeError;
+          }
+
+          const attempts =
+            Number((scribeError as any)?.scribeAttempts) || SCRIBE_MAX_RETRIES;
+          if (whisperSizeGuardMessage) {
+            const reason = scribeError?.message || String(scribeError);
+            console.warn(
+              `⚠️ /transcribe cannot fall back to Whisper after ${attempts} ElevenLabs attempts: ${whisperSizeGuardMessage}`
+            );
+            sendError(
+              res,
+              502,
+              "ElevenLabs transcription failed and Whisper fallback is unavailable for this file size",
+              `${reason}. ${whisperSizeGuardMessage}`
+            );
+            return;
+          }
+          console.warn(
+            `⚠️ /transcribe falling back to Whisper after ${attempts} ElevenLabs attempts: ${
+              scribeError?.message || String(scribeError)
+            }`
+          );
+          const transcription = await transcribeWithWhisperFromPath({
+            openaiKey,
+            filePath: file.filepath,
+            fileName: file.originalFilename || "audio.webm",
+            mimeType: file.mimetype || "audio/webm",
+            language: language || undefined,
+            prompt: prompt || undefined,
+          });
+          sendJson(res, {
+            ...transcription,
+            fallback: {
+              from: ELEVENLABS_TRANSCRIPTION_MODEL,
+              to: WHISPER_TRANSCRIPTION_MODEL,
+              attempts,
+              reason: scribeError?.message || String(scribeError),
+            },
+          });
+        }
+      } else {
+        if (!openaiKey) {
+          sendError(res, 401, "Unauthorized - missing OpenAI key");
+          return;
+        }
+        if (whisperSizeGuardMessage) {
+          sendError(
+            res,
+            413,
+            "File too large for Whisper transcription",
+            whisperSizeGuardMessage
+          );
+          return;
+        }
+
+        const transcription = await transcribeWithWhisperFromPath({
+          openaiKey,
+          filePath: file.filepath,
+          fileName: file.originalFilename || "audio.webm",
+          mimeType: file.mimetype || "audio/webm",
+          language: language || undefined,
+          prompt: prompt || undefined,
+        });
+
+        console.log("🎯 Relay transcription completed with Whisper.");
+        sendJson(res, transcription);
+      }
     } catch (error: any) {
       console.error("❌ Relay transcription error:", error.message);
       sendError(res, 500, "Transcription failed", error.message);
@@ -699,6 +1187,8 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // TODO(stage5-cleanup): Remove this legacy endpoint after all supported clients
+  // use /transcribe (worker path) or /transcribe-direct (app -> relay path).
   // Handle POST to /transcribe-elevenlabs (ElevenLabs Scribe)
   if (req.method === "POST" && req.url === "/transcribe-elevenlabs") {
     console.log("📡 Processing ElevenLabs Scribe transcription request...");
@@ -732,6 +1222,7 @@ const server = createServer(async (req, res) => {
         sendError(res, 400, "No file provided");
         return;
       }
+      const whisperSizeGuardMessage = getWhisperFileSizeGuardMessage(file.size);
 
       const language = Array.isArray(fields.language)
         ? fields.language[0]
@@ -751,41 +1242,7 @@ const server = createServer(async (req, res) => {
         languageCode: language || "auto",
         idempotencyKey,
       });
-
-      // ElevenLabs Scribe doesn't return an explicit duration field in our wrapper.
-      // Compute an approximate duration from the max segment end so upstream billing
-      // (stage5-api) can reliably deduct credits.
-      const duration =
-        result.segments.length > 0
-          ? Math.max(...result.segments.map((s) => s.end || 0))
-          : 0;
-
-      // Convert to Whisper-compatible format
-      const whisperFormat = {
-        text: result.text,
-        language: result.language_code,
-        duration,
-        approx_duration: duration,
-        segments: result.segments.map((seg, idx) => ({
-          id: idx,
-          start: seg.start,
-          end: seg.end,
-          text: seg.text,
-          words: seg.words?.map((w) => ({
-            word: w.text,
-            start: w.start,
-            end: w.end,
-          })),
-        })),
-        words: result.segments.flatMap(
-          (seg) =>
-            seg.words?.map((w) => ({
-              word: w.text,
-              start: w.start,
-              end: w.end,
-            })) || []
-        ),
-      };
+      const whisperFormat = toWhisperCompatibleScribeResult(result);
 
       console.log(`🎯 ElevenLabs Scribe transcription completed!`);
       sendJson(res, whisperFormat);
@@ -813,13 +1270,6 @@ const server = createServer(async (req, res) => {
     // Stable idempotency key from the app to prevent double billing on retries.
     const idempotencyKey =
       getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
-
-    const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-    if (!elevenLabsKey) {
-      console.log("❌ ElevenLabs API key not configured");
-      sendError(res, 500, "ElevenLabs not configured");
-      return;
-    }
 
     // Step 1: Authorize with CF Worker
     const CF_API_BASE = process.env.CF_API_BASE || "https://api.stage5.tools";
@@ -876,66 +1326,170 @@ const server = createServer(async (req, res) => {
         sendError(res, 400, "No file provided");
         return;
       }
+      const whisperSizeGuardMessage = getWhisperFileSizeGuardMessage(file.size);
 
       const language = Array.isArray(fields.language)
         ? fields.language[0]
         : fields.language;
+      const prompt = Array.isArray(fields.prompt)
+        ? fields.prompt[0]
+        : fields.prompt;
+      const modelHint = Array.isArray(fields.model)
+        ? fields.model[0]
+        : fields.model;
+      const modelIdHint = Array.isArray(fields.model_id)
+        ? fields.model_id[0]
+        : fields.model_id;
+      const qualityModeRaw =
+        (Array.isArray(fields.qualityMode)
+          ? fields.qualityMode[0]
+          : fields.qualityMode) ??
+        (Array.isArray(fields.quality_mode)
+          ? fields.quality_mode[0]
+          : fields.quality_mode);
+      const { useHighQuality, source: qualitySource } =
+        resolveDirectTranscriptionQuality({
+          explicitQualityRaw: qualityModeRaw,
+          modelHint:
+            typeof modelHint === "string" ? modelHint : undefined,
+          modelIdHint:
+            typeof modelIdHint === "string" ? modelIdHint : undefined,
+        });
 
       console.log(
-        `🎵 Transcribing with ElevenLabs Scribe: ${file.originalFilename} (${(
+        `🎵 Direct transcription mode: ${
+          useHighQuality ? "elevenlabs" : "whisper"
+        } (qualitySource=${qualitySource}) for ${file.originalFilename} (${(
           file.size /
           1024 /
           1024
         ).toFixed(1)}MB)`
       );
 
-      const result = await transcribeWithScribe({
-        filePath: file.filepath,
-        apiKey: elevenLabsKey,
-        languageCode: language || "auto",
-        idempotencyKey,
-      });
+      const openaiKey = process.env.OPENAI_API_KEY;
+      const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+      let effectiveHighQuality = useHighQuality;
+      if (effectiveHighQuality && !elevenLabsKey && openaiKey) {
+        effectiveHighQuality = false;
+        console.warn(
+          "⚠️ ElevenLabs key missing for high-quality /transcribe-direct; falling back to Whisper."
+        );
+      }
 
-      // Convert to Whisper-compatible format
-      const allWords = result.segments.flatMap(
-        (seg) =>
-          seg.words?.map((w) => ({
-            word: w.text,
-            start: w.start,
-            end: w.end,
-          })) || []
-      );
+      let transcriptionResult: any;
+      let billedModel: string;
 
-      const duration =
-        result.segments.length > 0
-          ? result.segments[result.segments.length - 1].end
-          : 0;
+      if (effectiveHighQuality) {
+        if (!elevenLabsKey) {
+          sendError(res, 500, "ElevenLabs not configured");
+          return;
+        }
 
-      const whisperFormat = {
-        text: result.text,
-        language: result.language_code,
-        segments: result.segments.map((seg, idx) => ({
-          id: idx,
-          start: seg.start,
-          end: seg.end,
-          text: seg.text,
-          words: seg.words?.map((w) => ({
-            word: w.text,
-            start: w.start,
-            end: w.end,
-          })),
-        })),
-        words: allWords,
-        duration,
-        approx_duration: duration,
-      };
+        try {
+          const { result, attempts } = await transcribeWithScribeWithRetries({
+            filePath: file.filepath,
+            apiKey: elevenLabsKey,
+            languageCode: language || "auto",
+            idempotencyKey,
+            contextLabel: "/transcribe-direct",
+          });
+          transcriptionResult = toWhisperCompatibleScribeResult(result);
+          if (attempts > 1) {
+            transcriptionResult = {
+              ...transcriptionResult,
+              retry: {
+                provider: ELEVENLABS_TRANSCRIPTION_MODEL,
+                attempts,
+              },
+            };
+          }
+          billedModel = ELEVENLABS_TRANSCRIPTION_MODEL;
+        } catch (scribeError: any) {
+          if (!openaiKey) {
+            throw scribeError;
+          }
+
+          const attempts =
+            Number((scribeError as any)?.scribeAttempts) || SCRIBE_MAX_RETRIES;
+          if (whisperSizeGuardMessage) {
+            const reason = scribeError?.message || String(scribeError);
+            console.warn(
+              `⚠️ /transcribe-direct cannot fall back to Whisper after ${attempts} ElevenLabs attempts: ${whisperSizeGuardMessage}`
+            );
+            sendError(
+              res,
+              502,
+              "ElevenLabs transcription failed and Whisper fallback is unavailable for this file size",
+              `${reason}. ${whisperSizeGuardMessage}`
+            );
+            return;
+          }
+          console.warn(
+            `⚠️ /transcribe-direct falling back to Whisper after ${attempts} ElevenLabs attempts: ${
+              scribeError?.message || String(scribeError)
+            }`
+          );
+
+          transcriptionResult = await transcribeWithWhisperFromPath({
+            openaiKey,
+            filePath: file.filepath,
+            fileName: file.originalFilename || "audio.webm",
+            mimeType: file.mimetype || "audio/webm",
+            language: language || undefined,
+            prompt: prompt || undefined,
+          });
+          transcriptionResult = {
+            ...transcriptionResult,
+            fallback: {
+              from: ELEVENLABS_TRANSCRIPTION_MODEL,
+              to: WHISPER_TRANSCRIPTION_MODEL,
+              attempts,
+              reason: scribeError?.message || String(scribeError),
+            },
+          };
+          billedModel = WHISPER_TRANSCRIPTION_MODEL;
+        }
+      } else {
+        if (!openaiKey) {
+          sendError(res, 500, "OpenAI not configured");
+          return;
+        }
+        if (whisperSizeGuardMessage) {
+          sendError(
+            res,
+            413,
+            "File too large for Whisper transcription",
+            whisperSizeGuardMessage
+          );
+          return;
+        }
+
+        transcriptionResult = await transcribeWithWhisperFromPath({
+          openaiKey,
+          filePath: file.filepath,
+          fileName: file.originalFilename || "audio.webm",
+          mimeType: file.mimetype || "audio/webm",
+          language: language || undefined,
+          prompt: prompt || undefined,
+        });
+        billedModel = WHISPER_TRANSCRIPTION_MODEL;
+      }
+
+      const durationForBilling =
+        Number.isFinite(transcriptionResult?.duration) &&
+        transcriptionResult.duration > 0
+          ? transcriptionResult.duration
+          : Number.isFinite(transcriptionResult?.approx_duration) &&
+              transcriptionResult.approx_duration > 0
+            ? transcriptionResult.approx_duration
+            : 0;
 
       console.log(
-        `🎯 Transcription completed! Duration: ${duration.toFixed(1)}s`
+        `🎯 Transcription completed! Duration: ${durationForBilling.toFixed(1)}s model=${billedModel}`
       );
 
       // Step 3: Deduct credits
-      console.log(`💳 Deducting credits for ${Math.ceil(duration)}s...`);
+      console.log(`💳 Deducting credits for ${Math.ceil(durationForBilling)}s...`);
       try {
         const deductRes = await fetch(`${CF_API_BASE}/transcribe/deduct`, {
           method: "POST",
@@ -945,7 +1499,8 @@ const server = createServer(async (req, res) => {
           },
           body: JSON.stringify({
             deviceId,
-            durationSeconds: duration,
+            durationSeconds: durationForBilling,
+            model: billedModel,
             ...(idempotencyKey ? { idempotencyKey } : {}),
           }),
         });
@@ -980,7 +1535,7 @@ const server = createServer(async (req, res) => {
       }
 
       // Return result to app (only after successful deduction)
-      sendJson(res, whisperFormat);
+      sendJson(res, transcriptionResult);
     } catch (error: any) {
       console.error("❌ Transcription error:", error.message);
       sendError(res, 500, "Transcription failed", error.message);
@@ -1048,8 +1603,29 @@ const server = createServer(async (req, res) => {
     try {
       const parsed = await readJsonBody(req);
       const messages = parsed?.messages;
-      const model = parsed?.model || DEFAULT_TRANSLATION_MODEL;
+      const translationPhase = parseTranslationPhase(parsed?.translationPhase);
+      const modelFamily = parseTranslationModelFamily(parsed?.modelFamily);
+      const qualityMode =
+        typeof parsed?.qualityMode === "boolean"
+          ? parsed.qualityMode
+          : undefined;
+      const model = resolveTranslationModel({
+        rawModel:
+          typeof parsed?.model === "string" && parsed.model.trim()
+            ? parsed.model.trim()
+            : DEFAULT_TRANSLATION_MODEL,
+        messages: Array.isArray(messages) ? messages : undefined,
+        canUseAnthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+        modelFamily,
+        translationPhase,
+        qualityMode,
+      });
       const reasoning = parsed?.reasoning;
+
+      if (!isAllowedStage5TranslationModel(model)) {
+        sendError(res, 400, `Unsupported translation model: ${model}`);
+        return;
+      }
 
       if (!Array.isArray(messages) || messages.length === 0) {
         sendError(res, 400, "Messages array required");
@@ -1106,7 +1682,7 @@ const server = createServer(async (req, res) => {
 
         result = {
           content: response.choices[0]?.message?.content || "",
-          model: response.model,
+          model,
           usage: response.usage,
         };
         promptTokens = response.usage?.prompt_tokens || 0;
@@ -1451,6 +2027,8 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // TODO(stage5-cleanup): Remove this legacy endpoint after stage5-api no longer
+  // calls /transcribe-from-r2 (R2 webhook transcription flow retired).
   // Handle POST to /transcribe-from-r2 (ElevenLabs Scribe from R2 URL) - LEGACY
   if (req.method === "POST" && req.url === "/transcribe-from-r2") {
     console.log("📡 Processing ElevenLabs Scribe from R2 URL...");
@@ -1541,41 +2119,11 @@ const server = createServer(async (req, res) => {
             languageCode: language || "auto",
             idempotencyKey,
           });
-
-          // Convert to Whisper-compatible format (same as /transcribe-elevenlabs)
-          const allWords = result.segments.flatMap(
-            (seg) =>
-              seg.words?.map((w) => ({
-                word: w.text,
-                start: w.start,
-                end: w.end,
-              })) || []
-          );
-
-          // Calculate duration from segments
+          const whisperFormat = toWhisperCompatibleScribeResult(result);
           const duration =
-            result.segments.length > 0
-              ? result.segments[result.segments.length - 1].end
+            Number.isFinite(whisperFormat?.duration) && whisperFormat.duration > 0
+              ? whisperFormat.duration
               : 0;
-
-          const whisperFormat = {
-            text: result.text,
-            language: result.language_code,
-            segments: result.segments.map((seg, idx) => ({
-              id: idx,
-              start: seg.start,
-              end: seg.end,
-              text: seg.text,
-              words: seg.words?.map((w) => ({
-                word: w.text,
-                start: w.start,
-                end: w.end,
-              })),
-            })),
-            words: allWords,
-            duration,
-            approx_duration: duration,
-          };
 
           console.log(
             `🎯 ElevenLabs Scribe (R2) completed! Duration: ${duration.toFixed(
@@ -1886,15 +2434,33 @@ const server = createServer(async (req, res) => {
           role: String(m?.role ?? ""),
           content: String(m?.content ?? ""),
         }));
-        const model =
-          typeof parsed?.model === "string" && parsed.model.trim()
-            ? parsed.model.trim()
-            : DEFAULT_TRANSLATION_MODEL;
+        const translationPhase = parseTranslationPhase(parsed?.translationPhase);
+        const modelFamily = parseTranslationModelFamily(parsed?.modelFamily);
+        const qualityMode =
+          typeof parsed?.qualityMode === "boolean"
+            ? parsed.qualityMode
+            : undefined;
+        const model = resolveTranslationModel({
+          rawModel:
+            typeof parsed?.model === "string" && parsed.model.trim()
+              ? parsed.model.trim()
+              : DEFAULT_TRANSLATION_MODEL,
+          messages,
+          canUseAnthropic: Boolean(
+            anthropicKey || process.env.ANTHROPIC_API_KEY
+          ),
+          modelFamily,
+          translationPhase,
+          qualityMode,
+        });
         payload = {
           mode: "chat",
           messages,
           model,
+          modelFamily,
           reasoning: parsed?.reasoning,
+          translationPhase,
+          qualityMode,
         };
       } else if (
         typeof parsed?.text === "string" &&
@@ -1903,9 +2469,11 @@ const server = createServer(async (req, res) => {
         parsed.target_language.trim()
       ) {
         const model =
-          typeof parsed?.model === "string" && parsed.model.trim()
-            ? parsed.model.trim()
-            : DEFAULT_TRANSLATION_MODEL;
+          normalizeModelId(
+            typeof parsed?.model === "string" && parsed.model.trim()
+              ? parsed.model.trim()
+              : DEFAULT_TRANSLATION_MODEL
+          );
         payload = {
           mode: "text",
           text: parsed.text,
@@ -1920,6 +2488,15 @@ const server = createServer(async (req, res) => {
           400,
           "Invalid translation payload",
           "Expected messages[] or text/target_language"
+        );
+        return;
+      }
+
+      if (!isAllowedStage5TranslationModel(payload.model)) {
+        sendError(
+          res,
+          400,
+          `Unsupported translation model: ${payload.model}`
         );
         return;
       }
