@@ -1,36 +1,39 @@
-export const DEFAULT_TRANSLATION_MODEL = "gpt-5.1";
-export const CLAUDE_OPUS_MODEL = "claude-opus-4-6";
-export const ALLOWED_STAGE5_TRANSLATION_MODELS = [
-  DEFAULT_TRANSLATION_MODEL,
-  CLAUDE_OPUS_MODEL,
-] as const;
+import {
+  DEFAULT_STAGE5_TRANSLATION_MODEL,
+  STAGE5_CLAUDE_OPUS_MODEL,
+  STAGE5_ALLOWED_TRANSLATION_MODELS,
+  isAllowedStage5TranslationModelId,
+  normalizeStage5TranslationModel,
+} from "./model-catalog.js";
 
-const MODEL_ALIASES: Record<string, string> = {
-  "claude-opus-4.6": CLAUDE_OPUS_MODEL,
-};
+export const DEFAULT_TRANSLATION_MODEL = DEFAULT_STAGE5_TRANSLATION_MODEL;
+export const CLAUDE_OPUS_MODEL = STAGE5_CLAUDE_OPUS_MODEL;
+export const ALLOWED_STAGE5_TRANSLATION_MODELS = STAGE5_ALLOWED_TRANSLATION_MODELS;
+export const DEFAULT_CF_API_BASE = "https://api.stage5.tools";
 
-const ALLOWED_STAGE5_TRANSLATION_MODEL_SET = new Set<string>(
-  ALLOWED_STAGE5_TRANSLATION_MODELS
-);
-
-function canonicalizeModelId(model: string): string {
-  return (model || "").trim().toLowerCase();
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "");
 }
+
+export const CF_API_BASE = normalizeBaseUrl(
+  (process.env.CF_API_BASE || DEFAULT_CF_API_BASE).trim()
+);
 
 // File upload limits
 export const MAX_FILE_SIZE = 200 * 1024 * 1024; // 200MB
 
 // Model provider detection
 export function isClaudeModel(model: string): boolean {
-  return canonicalizeModelId(model).startsWith("claude-");
+  return String(model || "")
+    .trim()
+    .toLowerCase()
+    .startsWith("claude-");
 }
 
 export function normalizeModelId(model: string): string {
-  const canonical = canonicalizeModelId(model);
-  if (!canonical) return DEFAULT_TRANSLATION_MODEL;
-  return MODEL_ALIASES[canonical] || canonical;
+  return normalizeStage5TranslationModel(model);
 }
 
 export function isAllowedStage5TranslationModel(model: string): boolean {
-  return ALLOWED_STAGE5_TRANSLATION_MODEL_SET.has(normalizeModelId(model));
+  return isAllowedStage5TranslationModelId(model);
 }

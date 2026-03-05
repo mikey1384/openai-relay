@@ -14,11 +14,12 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": [
-    "index.ts"
-  ],
+  "include": ["**/*.ts"],
   "exclude": [
     "node_modules",
-    "dist"
+    "dist",
+    "relay-routes.ts",
+    "relay-routes-translation.ts",
+    "relay-routes-transcription.ts"
   ]
-} 
+}
