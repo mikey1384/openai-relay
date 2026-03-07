@@ -25,7 +25,7 @@ const DIRECT_REQUEST_LEASE_HEARTBEAT_MS = Math.max(
     ),
   ),
 );
-const RELAY_INSTANCE_ID = `relay:${process.pid}:${randomUUID()}`;
+let relayInstanceId: string | null = null;
 
 type DirectRequestLease = {
   version: 1;
@@ -133,9 +133,12 @@ export function normalizeRelayRecoveryFailureStatus(status: number): number {
 
 export function createDirectRequestLease(): DirectRequestLease {
   const now = new Date().toISOString();
+  if (!relayInstanceId) {
+    relayInstanceId = `relay:${process.pid}:${randomUUID()}`;
+  }
   return {
     version: 1,
-    instanceId: RELAY_INSTANCE_ID,
+    instanceId: relayInstanceId,
     ownerId: randomUUID(),
     acquiredAt: now,
     lastHeartbeatAt: now,
