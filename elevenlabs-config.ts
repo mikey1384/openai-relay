@@ -41,11 +41,13 @@ export async function transcribeWithScribe({
   apiKey,
   languageCode = "auto",
   idempotencyKey,
+  signal,
 }: {
   filePath: string;
   apiKey: string;
   languageCode?: string;
   idempotencyKey?: string;
+  signal?: AbortSignal;
 }): Promise<ScribeResult> {
   const fileBuffer = await fs.readFile(filePath);
   const fileName = filePath.split("/").pop() || "audio.webm";
@@ -71,6 +73,7 @@ export async function transcribeWithScribe({
       ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
     body: formData,
+    signal,
   });
 
   if (!response.ok) {
@@ -185,6 +188,68 @@ export interface TTSSegment {
   targetDuration?: number;
 }
 
+type ElevenLabsDubFormat = "mp3" | "opus" | "pcm" | "wav";
+
+function resolveElevenLabsDubFormat(format?: string): {
+  normalizedFormat: ElevenLabsDubFormat;
+  apiOutputFormat: string;
+  wrapPcmAsWav?: boolean;
+} {
+  const normalized = String(format || "mp3").trim().toLowerCase();
+  switch (normalized) {
+    case "mp3":
+      return {
+        normalizedFormat: "mp3",
+        apiOutputFormat: "mp3_44100_128",
+      };
+    case "opus":
+      return {
+        normalizedFormat: "opus",
+        apiOutputFormat: "opus_48000_32",
+      };
+    case "pcm":
+      return {
+        normalizedFormat: "pcm",
+        apiOutputFormat: "pcm_44100",
+      };
+    case "wav":
+      return {
+        normalizedFormat: "wav",
+        apiOutputFormat: "pcm_44100",
+        wrapPcmAsWav: true,
+      };
+    default:
+      throw new Error(
+        `ElevenLabs does not support requested output format "${normalized}"`
+      );
+  }
+}
+
+function wrapPcm16LeAsWav(
+  pcmBuffer: Buffer,
+  sampleRate = 44_100,
+  channels = 1,
+  bitsPerSample = 16
+): Buffer {
+  const blockAlign = (channels * bitsPerSample) / 8;
+  const byteRate = sampleRate * blockAlign;
+  const wavHeader = Buffer.alloc(44);
+  wavHeader.write("RIFF", 0);
+  wavHeader.writeUInt32LE(36 + pcmBuffer.length, 4);
+  wavHeader.write("WAVE", 8);
+  wavHeader.write("fmt ", 12);
+  wavHeader.writeUInt32LE(16, 16);
+  wavHeader.writeUInt16LE(1, 20);
+  wavHeader.writeUInt16LE(channels, 22);
+  wavHeader.writeUInt32LE(sampleRate, 24);
+  wavHeader.writeUInt32LE(byteRate, 28);
+  wavHeader.writeUInt16LE(blockAlign, 32);
+  wavHeader.writeUInt16LE(bitsPerSample, 34);
+  wavHeader.write("data", 36);
+  wavHeader.writeUInt32LE(pcmBuffer.length, 40);
+  return Buffer.concat([wavHeader, pcmBuffer]);
+}
+
 /**
  * Synthesize speech using ElevenLabs TTS API
  */
@@ -192,12 +257,16 @@ export async function synthesizeWithElevenLabs({
   text,
   voice = "adam",
   modelId = "eleven_multilingual_v2",
+  format = "mp3",
   apiKey,
+  signal,
 }: {
   text: string;
   voice?: string;
   modelId?: string;
+  format?: string;
   apiKey: string;
+  signal?: AbortSignal;
 }): Promise<Buffer> {
   // ElevenLabs voice IDs - map common names to IDs
   const voiceIdMap: Record<string, string> = {
@@ -227,8 +296,12 @@ export async function synthesizeWithElevenLabs({
 
   const voiceId = voiceIdMap[voice.toLowerCase()] || voice;
 
+  const outputSpec = resolveElevenLabsDubFormat(format);
+
   const response = await fetch(
-    `${ELEVENLABS_API_BASE}/text-to-speech/${voiceId}`,
+    `${ELEVENLABS_API_BASE}/text-to-speech/${voiceId}?output_format=${encodeURIComponent(
+      outputSpec.apiOutputFormat
+    )}`,
     {
       method: "POST",
       headers: {
@@ -243,6 +316,7 @@ export async function synthesizeWithElevenLabs({
           similarity_boost: 0.75,
         },
       }),
+      signal,
     }
   );
 
@@ -253,8 +327,12 @@ export async function synthesizeWithElevenLabs({
     );
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  const audioBuffer = Buffer.from(await response.arrayBuffer());
+  if (outputSpec.wrapPcmAsWav) {
+    return wrapPcm16LeAsWav(audioBuffer);
+  }
+
+  return audioBuffer;
 }
 
 /**

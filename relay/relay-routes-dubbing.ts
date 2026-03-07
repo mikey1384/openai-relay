@@ -3,10 +3,229 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { IncomingForm } from "formidable";
 import type { RelayRoutesContext } from "./relay-routes.js";
 import {
+  createDirectRequestLease,
+  normalizeRelayRecoveryFailureStatus,
+  persistDirectReplayOrRelease,
+  recoverOrRestartDuplicateReservation,
+  startDirectRequestLeaseHeartbeat,
+} from "./direct-replay-recovery.js";
+import {
+  deleteStoredDirectReplayArtifact,
+  extractStoredDirectReplayResult,
+  materializeStoredDirectReplayResult,
+  storeSuccessDirectReplayArtifact,
+  type DirectReplayResult as SharedDirectReplayResult,
+  type StoredDirectReplayResult,
+} from "./direct-replay-artifacts.js";
+import {
   authorizeRelayDevice,
-  deductRelayCredits,
+  confirmRelayReservation,
+  finalizeRelayCredits,
+  releaseRelayCredits,
+  reserveRelayCredits,
 } from "./relay-billing-client.js";
 import { STAGE5_RELAY_BILLING_SERVICES } from "./relay-billing-contract.js";
+import {
+  buildRelayRequestKey,
+  getInternalRelayBillingContext,
+} from "./relay-billing-helpers.js";
+
+type DirectDubbingReplayResult = SharedDirectReplayResult;
+
+type DirectDubbingReplayEntry = {
+  done: boolean;
+  promise: Promise<DirectDubbingReplayResult>;
+  resolve: (result: DirectDubbingReplayResult) => void;
+  result?: DirectDubbingReplayResult;
+  expiresAt?: number;
+};
+
+type PendingDirectDubbingFinalize = {
+  characters: number;
+  model: string;
+};
+
+const DIRECT_DUBBING_REPLAY_TTL_MS = Math.max(
+  1_000,
+  Number.parseInt(
+    process.env.DIRECT_DUBBING_REPLAY_TTL_MS || String(10 * 60 * 1_000),
+    10
+  )
+);
+const directDubbingReplayCache = new Map<string, DirectDubbingReplayEntry>();
+
+function createDirectDubbingReplayEntry(): DirectDubbingReplayEntry {
+  let resolve!: (result: DirectDubbingReplayResult) => void;
+  const promise = new Promise<DirectDubbingReplayResult>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return {
+    done: false,
+    promise,
+    resolve,
+  };
+}
+
+function pruneDirectDubbingReplayCache(now = Date.now()): void {
+  for (const [requestKey, entry] of directDubbingReplayCache.entries()) {
+    if (
+      entry.done &&
+      entry.result?.kind === "success" &&
+      typeof entry.expiresAt === "number" &&
+      entry.expiresAt <= now
+    ) {
+      directDubbingReplayCache.delete(requestKey);
+    }
+  }
+}
+
+function settleDirectDubbingReplayEntry({
+  requestKey,
+  entry,
+  result,
+  cacheSuccess = false,
+}: {
+  requestKey: string;
+  entry: DirectDubbingReplayEntry;
+  result: DirectDubbingReplayResult;
+  cacheSuccess?: boolean;
+}): void {
+  if (entry.done) {
+    return;
+  }
+
+  entry.done = true;
+  entry.result = result;
+  entry.resolve(result);
+
+  if (cacheSuccess && result.kind === "success") {
+    entry.expiresAt = Date.now() + DIRECT_DUBBING_REPLAY_TTL_MS;
+    directDubbingReplayCache.set(requestKey, entry);
+    return;
+  }
+
+  directDubbingReplayCache.delete(requestKey);
+}
+
+function sendDirectDubbingReplay(
+  res: ServerResponse,
+  replay: DirectDubbingReplayResult,
+  sendError: RelayRoutesContext["sendError"],
+  sendJson: RelayRoutesContext["sendJson"]
+): void {
+  if (replay.kind === "success") {
+    sendJson(res, replay.data, replay.status);
+    return;
+  }
+
+  sendError(res, replay.status, replay.error, replay.details);
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function extractStoredDirectDubbingReplay(
+  reservationMeta: unknown
+): StoredDirectReplayResult | null {
+  return extractStoredDirectReplayResult(reservationMeta, "Dubbing failed");
+}
+
+function buildStoredDirectDubbingReplayMeta(
+  storedReplay: StoredDirectReplayResult | null,
+): Record<string, unknown> {
+  if (!storedReplay) {
+    return {};
+  }
+  return {
+    directReplayResult: storedReplay,
+  };
+}
+
+function extractPendingDirectDubbingFinalize(
+  reservationMeta: unknown
+): PendingDirectDubbingFinalize | null {
+  const metaObject = asObject(reservationMeta);
+  const pendingObject = asObject(metaObject?.pendingFinalize);
+  if (!pendingObject) {
+    return null;
+  }
+
+  const characters = Number(pendingObject.characters);
+  const model =
+    typeof pendingObject.model === "string" ? pendingObject.model.trim() : "";
+  if (!model || !Number.isFinite(characters) || characters < 0) {
+    return null;
+  }
+
+  return { characters, model };
+}
+
+async function recoverReservedDirectDubbingReplay({
+  cfApiBase,
+  relaySecret,
+  deviceId,
+  requestKey,
+  reservationMeta,
+}: {
+  cfApiBase: string;
+  relaySecret: string;
+  deviceId: string;
+  requestKey: string;
+  reservationMeta: unknown;
+}): Promise<
+  | { kind: "replay"; replay: DirectDubbingReplayResult }
+  | { kind: "error"; status: number; error: string; details?: string }
+  | null
+> {
+  const storedReplay = extractStoredDirectDubbingReplay(reservationMeta);
+  const replay = await materializeStoredDirectReplayResult({
+    cfApiBase,
+    relaySecret,
+    storedReplay,
+  });
+  const pendingFinalize = extractPendingDirectDubbingFinalize(reservationMeta);
+  if (!storedReplay || !replay || !pendingFinalize) {
+    return null;
+  }
+  if (replay.kind !== "success") {
+    return {
+      kind: "error",
+      status: replay.status,
+      error: replay.error,
+      ...(replay.details ? { details: replay.details } : {}),
+    };
+  }
+
+  const finalizeResult = await finalizeRelayCredits({
+    cfApiBase,
+    relaySecret,
+    payload: {
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+      characters: pendingFinalize.characters,
+      model: pendingFinalize.model,
+      meta: {
+        ...buildStoredDirectDubbingReplayMeta(storedReplay),
+        pendingFinalize: null,
+      },
+    },
+  });
+
+  if (!finalizeResult.ok) {
+    return {
+      kind: "error",
+      status: normalizeRelayRecoveryFailureStatus(finalizeResult.status),
+      error: finalizeResult.error || "Credit finalize failed",
+    };
+  }
+
+  return { kind: "replay", replay };
+}
 
 export async function handleDubbingRoutes(
   req: IncomingMessage,
@@ -23,11 +242,6 @@ export async function handleDubbingRoutes(
     return true;
   }
 
-  if (req.method === "POST" && req.url === "/dub-video-elevenlabs") {
-    await handleDubVideoElevenLabs(req, res, ctx);
-    return true;
-  }
-
   if (req.method === "POST" && req.url === "/dub") {
     await handleDub(req, res, ctx);
     return true;
@@ -36,18 +250,6 @@ export async function handleDubbingRoutes(
   return false;
 }
 
-// ElevenLabs voice name to ID mapping
-const ELEVENLABS_VOICE_IDS: Record<string, string> = {
-  rachel: "21m00Tcm4TlvDq8ikWAM",
-  adam: "pNInz6obpgDQGcFmaJgB",
-  josh: "TxGEqnHWrfWFTfGW9XjX",
-  sarah: "EXAVITQu4vr4xnSDxMaL",
-  charlie: "IKne3meq5aSn9XLyUdCD",
-  emily: "LcfcDJNUP1GQjkzn1xUU",
-  matilda: "XrExE9yKIg1WjnnlVkGX",
-  brian: "nPczCjzI2devNBz1zQrb",
-};
-
 async function handleDubDirect(
   req: IncomingMessage,
   res: ServerResponse,
@@ -55,8 +257,15 @@ async function handleDubDirect(
 ): Promise<void> {
   console.log("📡 Processing direct dub request...");
 
-  const { RELAY_SECRET, getHeader, sendError, sendJson, readJsonBody, makeOpenAI } =
-    ctx;
+  const {
+    RELAY_SECRET,
+    getHeader,
+    sendError,
+    sendJson,
+    readJsonBody,
+    makeOpenAI,
+    synthesizeWithElevenLabs,
+  } = ctx;
 
   // Get API key from header (app sends its Stage5 API key)
   const apiKey = getHeader(req, "authorization")?.replace(/^Bearer\s+/i, "");
@@ -68,6 +277,7 @@ async function handleDubDirect(
 
   const idempotencyKey =
     getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
+  const appVersion = getHeader(req, "x-stage5-app-version");
 
   // Step 1: Authorize with CF Worker
   const { CF_API_BASE } = ctx;
@@ -77,6 +287,9 @@ async function handleDubDirect(
     cfApiBase: CF_API_BASE,
     relaySecret: RELAY_SECRET,
     apiKey,
+    service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+    clientIdempotencyKey: idempotencyKey,
+    appVersion,
   });
   if (!authResult.ok) {
     console.log(`❌ Authorization failed: ${authResult.status}`);
@@ -87,7 +300,30 @@ async function handleDubDirect(
   console.log(`✅ Authorized device ${deviceId}, balance: ${authResult.creditBalance}`);
 
   // Step 2: Parse request and synthesize speech
+  let replayContext:
+    | { requestKey: string; entry: DirectDubbingReplayEntry }
+    | null = null;
+  let stopLeaseHeartbeat: (() => void) | null = null;
   try {
+    let requestClosed = false;
+    const requestAbortController = new AbortController();
+    req.on("close", () => {
+      requestClosed = true;
+      requestAbortController.abort();
+    });
+    const isRequestAborted = () =>
+      requestClosed || requestAbortController.signal.aborted;
+    const buildAbortError = () => {
+      const error = new Error("Request cancelled");
+      error.name = "AbortError";
+      return error;
+    };
+    const throwIfRequestAborted = () => {
+      if (isRequestAborted()) {
+        throw buildAbortError();
+      }
+    };
+
     const parsed = await readJsonBody(req);
     const segments = parsed?.segments || [];
     const voice = parsed?.voice || "alloy";
@@ -105,6 +341,213 @@ async function handleDubDirect(
       (sum: number, seg: any) => sum + (seg.text?.length || seg.translation?.length || 0),
       0
     );
+    const requestKey = buildRelayRequestKey({
+      service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+      deviceId,
+      clientIdempotencyKey: idempotencyKey,
+      payload: {
+        segments,
+        voice,
+        model,
+        format,
+        ttsProvider,
+      },
+    });
+    pruneDirectDubbingReplayCache();
+    const existingReplay = directDubbingReplayCache.get(requestKey);
+    if (existingReplay) {
+      const replay = existingReplay.result ?? await existingReplay.promise;
+      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+      return;
+    }
+
+    const replayEntry = createDirectDubbingReplayEntry();
+    directDubbingReplayCache.set(requestKey, replayEntry);
+    replayContext = { requestKey, entry: replayEntry };
+    const sendReplaySuccess = (data: unknown, status = 200): void => {
+      const replay: DirectDubbingReplayResult = {
+        kind: "success",
+        status,
+        data,
+      };
+      settleDirectDubbingReplayEntry({
+        requestKey,
+        entry: replayEntry,
+        result: replay,
+        cacheSuccess: true,
+      });
+      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+    };
+    const sendReplayError = (
+      status: number,
+      error: string,
+      details?: string
+    ): void => {
+      const replay: DirectDubbingReplayResult = {
+        kind: "error",
+        status,
+        error,
+        ...(details ? { details } : {}),
+      };
+      settleDirectDubbingReplayEntry({
+        requestKey,
+        entry: replayEntry,
+        result: replay,
+      });
+      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+    };
+    const directRequestLease = createDirectRequestLease();
+    let reserveResult: Awaited<ReturnType<typeof reserveRelayCredits>> | null = null;
+    for (let orphanRecoveryAttempt = 0; orphanRecoveryAttempt < 2; orphanRecoveryAttempt += 1) {
+      reserveResult = await reserveRelayCredits({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        payload: {
+          deviceId,
+          requestKey,
+          service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+          characters: totalCharacters,
+          model: ttsProvider === "elevenlabs" ? "eleven_multilingual_v2" : model,
+          meta: {
+            directRequestLease,
+          },
+        },
+      });
+      if (!reserveResult.ok) {
+        sendReplayError(
+          reserveResult.status === 402 ? 402 : reserveResult.status,
+          reserveResult.error || "Credit reservation failed",
+        );
+        return;
+      }
+      if (reserveResult.status !== "duplicate") {
+        break;
+      }
+
+      if (reserveResult.reservationStatus === "reserved") {
+        const recovered = await recoverReservedDirectDubbingReplay({
+          cfApiBase: CF_API_BASE,
+          relaySecret: RELAY_SECRET,
+          deviceId,
+          requestKey,
+          reservationMeta: reserveResult.reservationMeta,
+        });
+        if (recovered?.kind === "replay") {
+          settleDirectDubbingReplayEntry({
+            requestKey,
+            entry: replayEntry,
+            result: recovered.replay,
+            cacheSuccess: recovered.replay.kind === "success",
+          });
+          sendDirectDubbingReplay(
+            res,
+            recovered.replay,
+            sendError,
+            sendJson
+          );
+          return;
+        }
+        if (recovered?.kind === "error") {
+          sendReplayError(
+            recovered.status,
+            recovered.error,
+            recovered.details
+          );
+          return;
+        }
+
+        const orphanRecovery = await recoverOrRestartDuplicateReservation({
+          cfApiBase: CF_API_BASE,
+          relaySecret: RELAY_SECRET,
+          deviceId,
+          requestKey,
+          service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+          reservationMeta: reserveResult.reservationMeta,
+          reservationUpdatedAt: reserveResult.reservationUpdatedAt,
+        });
+        if (!orphanRecovery.ok) {
+          sendReplayError(
+            orphanRecovery.status,
+            orphanRecovery.error,
+            orphanRecovery.details
+          );
+          return;
+        }
+        if (orphanRecovery.action === "reservation-settled") {
+          const settledReplay = await materializeStoredDirectReplayResult({
+            cfApiBase: CF_API_BASE,
+            relaySecret: RELAY_SECRET,
+            storedReplay: extractStoredDirectDubbingReplay(
+              orphanRecovery.reservationMeta
+            ),
+          });
+          if (settledReplay?.kind === "success") {
+            settleDirectDubbingReplayEntry({
+              requestKey,
+              entry: replayEntry,
+              result: settledReplay,
+              cacheSuccess: true,
+            });
+            sendDirectDubbingReplay(res, settledReplay, sendError, sendJson);
+            return;
+          }
+          if (settledReplay?.kind === "error") {
+            sendReplayError(
+              settledReplay.status,
+              settledReplay.error,
+              settledReplay.details
+            );
+            return;
+          }
+          sendReplayError(409, "Duplicate request already completed");
+          return;
+        }
+        if (orphanRecovery.action === "retry-reserve") {
+          continue;
+        }
+      }
+
+      const persistedReplay = await materializeStoredDirectReplayResult({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        storedReplay: extractStoredDirectDubbingReplay(
+          reserveResult.reservationMeta
+        ),
+      });
+      if (persistedReplay?.kind === "success") {
+        settleDirectDubbingReplayEntry({
+          requestKey,
+          entry: replayEntry,
+          result: persistedReplay,
+          cacheSuccess: true,
+        });
+        sendDirectDubbingReplay(res, persistedReplay, sendError, sendJson);
+        return;
+      }
+      if (persistedReplay?.kind === "error") {
+        sendReplayError(
+          persistedReplay.status,
+          persistedReplay.error,
+          persistedReplay.details
+        );
+        return;
+      }
+
+      sendReplayError(409, "Duplicate request");
+      return;
+    }
+    if (!reserveResult || !reserveResult.ok || reserveResult.status === "duplicate") {
+      sendReplayError(500, "Credit reservation failed");
+      return;
+    }
+    stopLeaseHeartbeat = startDirectRequestLeaseHeartbeat({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+      lease: directRequestLease,
+    });
 
     console.log(
       `🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ${ttsProvider}...`
@@ -113,85 +556,89 @@ async function handleDubDirect(
     let result: any;
     let ttsModel = model;
 
-    if (ttsProvider === "elevenlabs") {
-      // Use ElevenLabs
-      const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-      if (!elevenLabsKey) {
-        sendError(res, 500, "ElevenLabs not configured");
-        return;
-      }
-
-      // Map voice name to ElevenLabs voice ID
-      const voiceId = ELEVENLABS_VOICE_IDS[voice] || ELEVENLABS_VOICE_IDS.rachel;
-
-      ttsModel = "eleven_multilingual_v2";
-      const segmentResults: Array<{
-        index: number;
-        audioBase64: string;
-        targetDuration?: number;
-      }> = [];
-
-      for (const seg of segments) {
-        const text = seg.text || seg.translation || "";
-        if (!text.trim()) continue;
-
-        const elevenRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
-          method: "POST",
-          headers: {
-            "xi-api-key": elevenLabsKey,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            text,
-            model_id: "eleven_multilingual_v2",
-            voice_settings: {
-              stability: 0.5,
-              similarity_boost: 0.75,
+    try {
+      if (ttsProvider === "elevenlabs") {
+        // Use ElevenLabs
+        const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+        if (!elevenLabsKey) {
+          await releaseRelayCredits({
+            cfApiBase: CF_API_BASE,
+            relaySecret: RELAY_SECRET,
+            payload: {
+              deviceId,
+              requestKey,
+              service: STAGE5_RELAY_BILLING_SERVICES.TTS,
             },
-          }),
-        });
-
-        if (!elevenRes.ok) {
-          const errText = await elevenRes.text();
-          throw new Error(`ElevenLabs API error: ${elevenRes.status} ${errText}`);
+          });
+          sendReplayError(500, "ElevenLabs not configured");
+          return;
         }
 
-        const audioBuffer = await elevenRes.arrayBuffer();
-        segmentResults.push({
-          index: seg.index ?? segmentResults.length,
-          audioBase64: Buffer.from(audioBuffer).toString("base64"),
-          targetDuration: seg.targetDuration,
-        });
-      }
+        ttsModel = "eleven_multilingual_v2";
+        const segmentResults: Array<{
+          index: number;
+          audioBase64: string;
+          targetDuration?: number;
+        }> = [];
 
-      result = {
-        segments: segmentResults,
-        format: "mp3",
-        voice,
-        model: ttsModel,
-        segmentCount: segmentResults.length,
-      };
-    } else {
-      // Use OpenAI TTS
-      console.log("   >>> Entering OpenAI TTS branch");
-      const openaiKey = process.env.OPENAI_API_KEY;
-      console.log("   >>> OpenAI key exists:", !!openaiKey);
-      if (!openaiKey) {
-        sendError(res, 500, "OpenAI not configured");
-        return;
-      }
+        for (const seg of segments) {
+          throwIfRequestAborted();
+          const text = seg.text || seg.translation || "";
+          if (!text.trim()) continue;
 
-      const client = makeOpenAI(openaiKey);
-      const segmentResults: Array<{
-        index: number;
-        audioBase64: string;
-        targetDuration?: number;
-      }> = [];
+          const audioBuffer = await synthesizeWithElevenLabs({
+            text,
+            voice,
+            modelId: "eleven_multilingual_v2",
+            format,
+            apiKey: elevenLabsKey,
+            signal: requestAbortController.signal,
+          });
+          segmentResults.push({
+            index: seg.index ?? segmentResults.length,
+            audioBase64: audioBuffer.toString("base64"),
+            targetDuration: seg.targetDuration,
+          });
+        }
+
+        result = {
+          segments: segmentResults,
+          format,
+          voice,
+          model: ttsModel,
+          segmentCount: segmentResults.length,
+        };
+      } else {
+        // Use OpenAI TTS
+        console.log("   >>> Entering OpenAI TTS branch");
+        const openaiKey = process.env.OPENAI_API_KEY;
+        console.log("   >>> OpenAI key exists:", !!openaiKey);
+        if (!openaiKey) {
+          await releaseRelayCredits({
+            cfApiBase: CF_API_BASE,
+            relaySecret: RELAY_SECRET,
+            payload: {
+              deviceId,
+              requestKey,
+              service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+            },
+          });
+          sendReplayError(500, "OpenAI not configured");
+          return;
+        }
+
+        const client = makeOpenAI(openaiKey);
+        const segmentResults: Array<{
+          index: number;
+          audioBase64: string;
+          targetDuration?: number;
+        }> = [];
 
       console.log(`   DEBUG: About to process ${segments.length} segments for OpenAI TTS`);
       console.log(`   DEBUG: First segment:`, JSON.stringify(segments[0]));
 
       for (const seg of segments) {
+        throwIfRequestAborted();
         const text = seg.text || seg.translation || "";
         if (!text.trim()) continue;
 
@@ -200,12 +647,15 @@ async function handleDubDirect(
         );
 
         try {
-          const ttsRes = await client.audio.speech.create({
-            model,
-            voice: voice as any,
-            input: text,
-            response_format: format as any,
-          });
+          const ttsRes = await client.audio.speech.create(
+            {
+              model,
+              voice: voice as any,
+              input: text,
+              response_format: format as any,
+            },
+            { signal: requestAbortController.signal }
+          );
 
           const audioBuffer = await ttsRes.arrayBuffer();
           segmentResults.push({
@@ -223,55 +673,165 @@ async function handleDubDirect(
         }
       }
 
-      result = {
-        segments: segmentResults,
-        format,
-        voice,
-        model,
-        segmentCount: segmentResults.length,
-      };
-    }
+        result = {
+          segments: segmentResults,
+          format,
+          voice,
+          model,
+          segmentCount: segmentResults.length,
+        };
+      }
+    } catch (ttsError: any) {
+      if (
+        isRequestAborted() ||
+        ttsError?.name === "AbortError" ||
+        String(ttsError?.message || "").includes("Request cancelled")
+      ) {
+        await releaseRelayCredits({
+          cfApiBase: CF_API_BASE,
+          relaySecret: RELAY_SECRET,
+          payload: {
+            deviceId,
+            requestKey,
+            service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+            meta: { reason: "client-cancelled" },
+          },
+        });
+        sendReplayError(408, "Request cancelled", "Request was cancelled");
+        return;
+      }
 
-    console.log(`🎯 TTS complete! ${result.segmentCount} segments`);
-
-    // Step 3: Deduct credits
-    console.log(`💳 Deducting credits for ${totalCharacters} characters...`);
-    try {
-      const deductResult = await deductRelayCredits({
+      await releaseRelayCredits({
         cfApiBase: CF_API_BASE,
         relaySecret: RELAY_SECRET,
         payload: {
           deviceId,
+          requestKey,
+          service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+          meta: { reason: "vendor-error", message: ttsError?.message || String(ttsError) },
+        },
+      });
+      throw ttsError;
+    }
+
+    console.log(`🎯 TTS complete! ${result.segmentCount} segments`);
+
+    const replaySuccess: DirectDubbingReplayResult = {
+      kind: "success",
+      status: 200,
+      data: result,
+    };
+    const pendingFinalize: PendingDirectDubbingFinalize = {
+      characters: totalCharacters,
+      model: ttsModel,
+    };
+    const storedReplayResult = await storeSuccessDirectReplayArtifact({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+      replay: replaySuccess,
+    });
+    if (!storedReplayResult.ok) {
+      sendReplayError(
+        storedReplayResult.status,
+        storedReplayResult.error || "Replay persistence failed",
+      );
+      return;
+    }
+    const persistResult = await persistDirectReplayOrRelease({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+      replayResult: storedReplayResult.storedReplay,
+      pendingFinalize,
+    });
+    if (!persistResult.ok) {
+      await deleteStoredDirectReplayArtifact({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        storedReplay: storedReplayResult.storedReplay,
+      });
+      sendReplayError(
+        persistResult.status,
+        persistResult.error || "Replay persistence failed",
+        persistResult.details
+      );
+      return;
+    }
+    stopLeaseHeartbeat?.();
+    stopLeaseHeartbeat = null;
+
+    if (isRequestAborted()) {
+      console.warn(
+        "⚠️ /dub-direct cancelled after replay persistence; leaving pending finalize for retry recovery",
+      );
+      sendReplayError(408, "Request cancelled", "Request was cancelled");
+      return;
+    }
+
+    console.log(`💳 Finalizing credits for ${totalCharacters} characters...`);
+    try {
+      const finalizeResult = await finalizeRelayCredits({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        payload: {
+          deviceId,
+          requestKey,
           service: STAGE5_RELAY_BILLING_SERVICES.TTS,
           characters: totalCharacters,
           model: ttsModel,
-          ...(idempotencyKey ? { idempotencyKey } : {}),
+          meta: {
+            ...buildStoredDirectDubbingReplayMeta(
+              storedReplayResult.storedReplay
+            ),
+            pendingFinalize: null,
+          },
         },
       });
 
-      if (!deductResult.ok) {
-        console.error(`❌ Credit deduction failed: ${deductResult.status}`);
-        const status = deductResult.status === 402 ? 402 : 500;
-        sendError(
-          res,
-          status,
-          deductResult.error || "Credit deduction failed"
+      if (!finalizeResult.ok) {
+        console.error(`❌ Credit finalize failed: ${finalizeResult.status}`);
+        sendReplayError(
+          normalizeRelayRecoveryFailureStatus(finalizeResult.status),
+          finalizeResult.error || "Credit finalize failed"
         );
         return;
       }
 
-      console.log(`✅ Credits deducted successfully`);
+      console.log(`✅ Credits finalized successfully`);
     } catch (deductErr: any) {
-      console.error("❌ Credit deduction request failed:", deductErr.message);
-      sendError(res, 500, "Credit deduction failed", deductErr?.message);
+      console.error("❌ Credit finalize request failed:", deductErr.message);
+      sendReplayError(500, "Credit finalize failed", deductErr?.message);
       return;
     }
 
     // Return result to app (only after successful deduction)
-    sendJson(res, result);
+    sendReplaySuccess(result);
   } catch (error: any) {
     console.error("❌ Dub error:", error.message);
+    if (replayContext) {
+      const replay: DirectDubbingReplayResult = {
+        kind: "error",
+        status: 500,
+        error: "Dub synthesis failed",
+        details: error.message,
+      };
+      settleDirectDubbingReplayEntry({
+        requestKey: replayContext.requestKey,
+        entry: replayContext.entry,
+        result: replay,
+      });
+      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+      return;
+    }
+
     sendError(res, 500, "Dub synthesis failed", error.message);
+  } finally {
+    stopLeaseHeartbeat?.();
   }
 }
 
@@ -283,6 +843,7 @@ async function handleDubElevenLabs(
   console.log("🎬 Processing ElevenLabs TTS dub request...");
 
   const {
+    CF_API_BASE,
     RELAY_SECRET,
     getHeader,
     sendError,
@@ -298,13 +859,38 @@ async function handleDubElevenLabs(
     return;
   }
 
-  const elevenLabsKey =
-    getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+  const internalBilling = getInternalRelayBillingContext(req, getHeader);
+  if (!internalBilling) {
+    sendError(res, 401, "Unauthorized - missing Stage5 billing context");
+    return;
+  }
+  const confirmResult = await confirmRelayReservation({
+    cfApiBase: CF_API_BASE,
+    relaySecret: RELAY_SECRET,
+    payload: {
+      deviceId: internalBilling.deviceId,
+      requestKey: internalBilling.requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+    },
+  });
+  if (!confirmResult.ok) {
+    sendError(res, confirmResult.status, confirmResult.error || "Reservation confirmation failed");
+    return;
+  }
+
+  const elevenLabsKey = getHeader(req, "x-elevenlabs-key");
   if (!elevenLabsKey) {
     console.log("❌ ElevenLabs API key not provided");
     sendError(res, 500, "ElevenLabs not configured");
     return;
   }
+
+  let requestClosed = false;
+  const requestAbortController = new AbortController();
+  req.on("close", () => {
+    requestClosed = true;
+    requestAbortController.abort();
+  });
 
   try {
     const parsed = await readJsonBody(req);
@@ -332,13 +918,17 @@ async function handleDubElevenLabs(
     }
 
     const voice = parsed?.voice || "adam";
+    const format =
+      typeof parsed?.format === "string" && parsed.format.trim()
+        ? parsed.format.trim()
+        : "mp3";
     const totalCharacters = segmentsPayload.reduce(
       (sum: number, seg: any) => sum + seg.text.length,
       0
     );
 
     console.log(
-      `🎧 Synthesizing ${segmentsPayload.length} segments (${totalCharacters} chars) with ElevenLabs voice=${voice}`
+      `🎧 Synthesizing ${segmentsPayload.length} segments (${totalCharacters} chars) with ElevenLabs voice=${voice} format=${format}`
     );
 
     const segmentResponses: Array<{
@@ -350,13 +940,22 @@ async function handleDubElevenLabs(
     // Process segments with concurrency limit
     const CONCURRENCY = 3;
     for (let i = 0; i < segmentsPayload.length; i += CONCURRENCY) {
+      if (requestClosed || requestAbortController.signal.aborted) {
+        console.warn("⚠️ /dub-elevenlabs aborted by upstream client during synthesis");
+        return;
+      }
       const batch = segmentsPayload.slice(i, i + CONCURRENCY);
       const results = await Promise.all(
         batch.map(async (seg: any) => {
+          if (requestClosed || requestAbortController.signal.aborted) {
+            throw new Error("Client disconnected");
+          }
           const audioBuffer = await synthesizeWithElevenLabs({
             text: seg.text,
             voice,
+            format,
             apiKey: elevenLabsKey,
+            signal: requestAbortController.signal,
           });
           return {
             index: seg.index,
@@ -374,116 +973,21 @@ async function handleDubElevenLabs(
     sendJson(res, {
       voice,
       model: "eleven_multilingual_v2",
-      format: "mp3",
+      format,
       segmentCount: segmentResponses.length,
       totalCharacters,
       segments: segmentResponses,
     });
   } catch (error: any) {
+    if (
+      error?.name === "AbortError" ||
+      String(error?.message || "").includes("Client disconnected")
+    ) {
+      console.warn("⚠️ /dub-elevenlabs aborted by upstream client");
+      return;
+    }
     console.error("❌ ElevenLabs TTS error:", error.message);
     sendError(res, 500, "Dub synthesis failed", error.message);
-  }
-}
-
-async function handleDubVideoElevenLabs(
-  req: IncomingMessage,
-  res: ServerResponse,
-  ctx: RelayRoutesContext
-): Promise<void> {
-  console.log("🎬 Processing ElevenLabs video dubbing request...");
-
-  const {
-    RELAY_SECRET,
-    getHeader,
-    sendError,
-    sendJson,
-    validateRelaySecret,
-    dubWithElevenLabs,
-  } = ctx;
-
-  if (!validateRelaySecret(req, RELAY_SECRET)) {
-    console.log("❌ Invalid or missing relay secret for /dub-video-elevenlabs");
-    sendError(res, 401, "Unauthorized - invalid relay secret");
-    return;
-  }
-
-  const elevenLabsKey =
-    getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
-  if (!elevenLabsKey) {
-    console.log("❌ ElevenLabs API key not provided");
-    sendError(res, 500, "ElevenLabs not configured");
-    return;
-  }
-
-  try {
-    const form = new IncomingForm({
-      maxFileSize: 500 * 1024 * 1024, // 500MB for video files
-    });
-    const [fields, files] = await form.parse(req);
-
-    const file = Array.isArray(files.file) ? files.file[0] : files.file;
-    if (!file) {
-      console.log("❌ No file provided for dubbing");
-      sendError(res, 400, "No file provided");
-      return;
-    }
-
-    const targetLanguage = Array.isArray(fields.target_language)
-      ? fields.target_language[0]
-      : fields.target_language;
-    if (!targetLanguage) {
-      console.log("❌ No target language provided");
-      sendError(res, 400, "target_language is required");
-      return;
-    }
-
-    const sourceLanguage = Array.isArray(fields.source_language)
-      ? fields.source_language[0]
-      : fields.source_language;
-    const numSpeakersField = Array.isArray(fields.num_speakers)
-      ? fields.num_speakers[0]
-      : fields.num_speakers;
-    // Safe parseInt with Number.isFinite validation
-    const numSpeakersRaw = numSpeakersField ? parseInt(numSpeakersField, 10) : undefined;
-    const numSpeakers =
-      numSpeakersRaw !== undefined &&
-      Number.isFinite(numSpeakersRaw) &&
-      numSpeakersRaw > 0
-        ? numSpeakersRaw
-        : undefined;
-    const dropBackgroundAudioField = Array.isArray(fields.drop_background_audio)
-      ? fields.drop_background_audio[0]
-      : fields.drop_background_audio;
-    const dropBackgroundAudio = dropBackgroundAudioField !== "false";
-
-    console.log(
-      `🎬 Dubbing video: ${file.originalFilename} (${(
-        file.size /
-        1024 /
-        1024
-      ).toFixed(1)}MB) → ${targetLanguage}`
-    );
-
-    const fs = await import("fs");
-    const fileBuffer = await fs.promises.readFile(file.filepath);
-
-    const result = await dubWithElevenLabs({
-      fileBuffer,
-      fileName: file.originalFilename || "video.mp4",
-      mimeType: file.mimetype || "video/mp4",
-      sourceLanguage: sourceLanguage || undefined,
-      targetLanguage,
-      apiKey: elevenLabsKey,
-      numSpeakers,
-      dropBackgroundAudio,
-      onProgress: (status: string) => console.log(`   • ${status}`),
-    });
-
-    console.log(`🎯 ElevenLabs video dubbing completed!`);
-    sendJson(res, result);
-  } catch (error: any) {
-    console.error("❌ ElevenLabs video dubbing error:", error.message);
-    sendError(res, 500, "Video dubbing failed", error.message);
   }
 }
 
@@ -495,6 +999,7 @@ async function handleDub(
   console.log("🎬 Processing dub synthesis request...");
 
   const {
+    CF_API_BASE,
     RELAY_SECRET,
     DUB_MAX_SEGMENTS,
     DUB_MAX_TOTAL_CHARACTERS,
@@ -517,6 +1022,25 @@ async function handleDub(
   if (!validateRelaySecret(req, RELAY_SECRET)) {
     console.log("❌ Invalid or missing relay secret for /dub");
     sendError(res, 401, "Unauthorized - invalid relay secret");
+    return;
+  }
+
+  const internalBilling = getInternalRelayBillingContext(req, getHeader);
+  if (!internalBilling) {
+    sendError(res, 401, "Unauthorized - missing Stage5 billing context");
+    return;
+  }
+  const confirmResult = await confirmRelayReservation({
+    cfApiBase: CF_API_BASE,
+    relaySecret: RELAY_SECRET,
+    payload: {
+      deviceId: internalBilling.deviceId,
+      requestKey: internalBilling.requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TTS,
+    },
+  });
+  if (!confirmResult.ok) {
+    sendError(res, confirmResult.status, confirmResult.error || "Reservation confirmation failed");
     return;
   }
 

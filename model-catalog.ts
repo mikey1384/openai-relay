@@ -3,6 +3,7 @@ function canonicalizeModelId(model?: string): string {
 }
 
 export const DEFAULT_STAGE5_TRANSLATION_MODEL = "gpt-5.1";
+export const STAGE5_REVIEW_TRANSLATION_MODEL = "gpt-5.4";
 export const STAGE5_CLAUDE_OPUS_MODEL = "claude-opus-4-6";
 
 export const STAGE5_TRANSLATION_MODEL_ALIASES = {
@@ -11,6 +12,7 @@ export const STAGE5_TRANSLATION_MODEL_ALIASES = {
 
 export const STAGE5_ALLOWED_TRANSLATION_MODELS = [
   DEFAULT_STAGE5_TRANSLATION_MODEL,
+  STAGE5_REVIEW_TRANSLATION_MODEL,
   STAGE5_CLAUDE_OPUS_MODEL,
 ] as const;
 

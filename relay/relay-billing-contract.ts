@@ -6,7 +6,14 @@ export const STAGE5_RELAY_BILLING_SERVICES = {
 
 export const STAGE5_RELAY_BILLING_ENDPOINTS = {
   AUTHORIZE: "/auth/authorize",
-  DEDUCT: "/auth/deduct",
+  CONFIRM: "/auth/confirm",
+  RESERVE: "/auth/reserve",
+  FINALIZE: "/auth/finalize",
+  PERSIST: "/auth/persist",
+  RELEASE: "/auth/release",
+  REPLAY_STORE: "/auth/replay-store",
+  REPLAY_LOAD: "/auth/replay-load",
+  REPLAY_DELETE: "/auth/replay-delete",
 } as const;
 
 function normalizeBaseUrl(baseUrl: string): string {

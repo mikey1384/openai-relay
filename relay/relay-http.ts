@@ -52,21 +52,27 @@ export function sendJson(
 }
 
 /**
- * Get CORS origin based on request origin and allowlist.
+ * Resolve the CORS origin policy for a browser request.
+ *
+ * Semantics:
+ * - no Origin header: non-browser caller, skip CORS headers
+ * - empty allowlist: browser CORS disabled
+ * - "*" in allowlist: allow any origin by echoing it back
+ * - otherwise: exact origin match only
  */
 export function getCorsOrigin(
   req: IncomingMessage,
   allowedOrigins: string[]
-): string {
+): string | null {
   const requestOrigin = getHeader(req, "origin");
 
-  if (allowedOrigins.includes("*")) {
-    return "*";
+  if (!requestOrigin || allowedOrigins.length === 0) {
+    return null;
   }
 
-  if (requestOrigin && allowedOrigins.includes(requestOrigin)) {
+  if (allowedOrigins.includes("*")) {
     return requestOrigin;
   }
 
-  return allowedOrigins[0] || "*";
+  return allowedOrigins.includes(requestOrigin) ? requestOrigin : null;
 }

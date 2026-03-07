@@ -11,6 +11,7 @@ import { handleSpeechRoutes } from "./relay-routes-speech.js";
 import { handleTranscriptionRoutes } from "./relay-routes-transcription.js";
 import { handleTranslationRoutes } from "./relay-routes-translation.js";
 import { handleDubbingRoutes } from "./relay-routes-dubbing.js";
+import { enforceMinimumTranslatorVersion } from "./translator-version-gate.js";
 
 export type RelayChatMessage = {
   role: string;
@@ -69,7 +70,7 @@ export interface RelayRoutesContext {
   MAX_TTS_CHARS_PER_CHUNK: number;
   SCRIBE_MAX_RETRIES: number;
   DEFAULT_TRANSLATION_MODEL: string;
-  getCorsOrigin: (req: IncomingMessage, allowedOrigins: string[]) => string;
+  getCorsOrigin: (req: IncomingMessage, allowedOrigins: string[]) => string | null;
   getHeader: (req: IncomingMessage, name: string) => string | undefined;
   sendError: (
     res: ServerResponse,
@@ -115,12 +116,15 @@ export interface RelayRoutesContext {
     apiKey: string;
     languageCode?: string;
     idempotencyKey?: string;
+    signal?: AbortSignal;
   }) => Promise<ScribeResult>;
   synthesizeWithElevenLabs: (params: {
     text: string;
     voice?: string;
     modelId?: string;
+    format?: string;
     apiKey: string;
+    signal?: AbortSignal;
   }) => Promise<Buffer>;
   dubWithElevenLabs: (params: {
     fileBuffer: Buffer;
@@ -142,6 +146,7 @@ export interface RelayRoutesContext {
     mimeType: string;
     language?: string;
     prompt?: string;
+    signal?: AbortSignal;
   }) => Promise<WhisperCompatibleTranscriptionResult>;
   transcribeWithScribeWithRetries: (params: {
     filePath: string;
@@ -149,6 +154,7 @@ export interface RelayRoutesContext {
     languageCode: string;
     idempotencyKey?: string;
     contextLabel: string;
+    signal?: AbortSignal;
   }) => Promise<{
     result: ScribeResult;
     attempts: number;
@@ -174,6 +180,10 @@ export interface RelayRoutesContext {
     translationPhase?: "draft" | "review";
     qualityMode?: boolean;
   }) => string;
+  resolveTranslationReservationMaxCompletionTokens: (params: {
+    model: string;
+    reasoning?: { effort?: "low" | "medium" | "high" } | null;
+  }) => number;
   isAllowedStage5TranslationModel: (model: string) => boolean;
   isClaudeModel: (model: string) => boolean;
   normalizeModelId: (model: string) => string;
@@ -193,6 +203,7 @@ export interface RelayRoutesContext {
     messages: RelayChatMessage[];
     model: string;
     apiKey: string;
+    maxTokens?: number;
     effort?: "low" | "medium" | "high";
   }) => Promise<{
     model: string;
@@ -203,6 +214,7 @@ export interface RelayRoutesContext {
     messages: any[];
     model: string;
     apiKey: string;
+    maxOutputTokens?: number;
     reasoning?: any;
   }) => Promise<{
     model: string;
@@ -234,21 +246,25 @@ export async function handleRelayRequest(
 
   // Enable CORS with configurable origins
   const corsOrigin = getCorsOrigin(req, ALLOWED_ORIGINS);
-  res.setHeader("Access-Control-Allow-Origin", corsOrigin);
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Idempotency-Key, X-Idempotency-Key, X-Relay-Secret, X-OpenAI-Key, X-Anthropic-Key, X-ElevenLabs-Key"
-  );
-  if (corsOrigin !== "*") {
+  if (corsOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+    res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, Idempotency-Key, X-Idempotency-Key, X-Stage5-App-Version"
+    );
     res.setHeader("Vary", "Origin");
   }
 
   // Handle preflight requests
   if (req.method === "OPTIONS") {
     console.log("✅ Responding to preflight request");
-    res.writeHead(200);
+    res.writeHead(corsOrigin ? 200 : 403);
     res.end();
+    return;
+  }
+
+  if (enforceMinimumTranslatorVersion({ req, res, sendJson: ctx.sendJson })) {
     return;
   }
 

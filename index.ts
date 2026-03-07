@@ -4,7 +4,6 @@ import { makeOpenAI } from "./openai-config.js";
 import { makeAnthropic, translateWithClaude } from "./anthropic-config.js";
 import {
   CF_API_BASE,
-  CLAUDE_OPUS_MODEL,
   DEFAULT_TRANSLATION_MODEL,
   isAllowedStage5TranslationModel,
   isClaudeModel,
@@ -30,12 +29,11 @@ import {
   upsertDurableRelayTranslationJob,
 } from "./relay/relay-job-sync.js";
 import {
-  isLikelySubtitleDraftMessages,
-  isLikelySubtitleReviewMessages,
   parseBooleanLike,
   parseTranslationModelFamily,
   parseTranslationPhase,
-  type TranslationModelFamily,
+  resolveTranslationModel,
+  resolveTranslationReservationMaxCompletionTokens,
 } from "./relay/relay-translation-helpers.js";
 import {
   handleRelayRequest,
@@ -112,15 +110,25 @@ if (!RELAY_SECRET_ENV) {
 }
 const RELAY_SECRET: string = RELAY_SECRET_ENV;
 
-// Allowed CORS origins (restrict in production)
+// Browser CORS policy for direct relay callers.
+// - empty: disable browser CORS
+// - "*": allow any Origin header
+// - otherwise: comma-separated exact origins
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
-  : ["*"]; // Default to * for backwards compatibility
-
-// Allowed R2 bucket hostnames for SSRF prevention
-const ALLOWED_R2_HOSTS = process.env.ALLOWED_R2_HOSTS
-  ? process.env.ALLOWED_R2_HOSTS.split(",").map((h) => h.trim().toLowerCase())
+  ? process.env.ALLOWED_ORIGINS.split(",")
+      .map((o) => o.trim())
+      .filter(Boolean)
   : [];
+
+const DEFAULT_ALLOWED_R2_HOSTS = ["r2.cloudflarestorage.com"];
+// Allowed R2 bucket hostnames for SSRF prevention.
+// By default, permit Cloudflare R2 signed download hosts so the legacy
+// `/transcribe-from-r2` path keeps working until its callers are removed.
+const ALLOWED_R2_HOSTS = (
+  process.env.ALLOWED_R2_HOSTS
+    ? process.env.ALLOWED_R2_HOSTS.split(",")
+    : DEFAULT_ALLOWED_R2_HOSTS
+).map((h) => h.trim().toLowerCase()).filter(Boolean);
 
 type ChatJobPayload = RelayChatJobPayload;
 type TextJobPayload = RelayTextJobPayload;
@@ -153,12 +161,6 @@ function validateR2Url(urlString: string): { valid: boolean; error?: string } {
     // Must be HTTPS
     if (url.protocol !== "https:") {
       return { valid: false, error: "R2 URL must use HTTPS" };
-    }
-
-    // If no allowed hosts configured, allow any (backwards compat)
-    if (ALLOWED_R2_HOSTS.length === 0) {
-      console.warn("⚠️ ALLOWED_R2_HOSTS not configured - allowing any R2 URL");
-      return { valid: true };
     }
 
     // Check against whitelist
@@ -274,6 +276,7 @@ async function transcribeWithWhisperFromPath({
   mimeType,
   language,
   prompt,
+  signal,
 }: {
   openaiKey: string;
   filePath: string;
@@ -281,6 +284,7 @@ async function transcribeWithWhisperFromPath({
   mimeType: string;
   language?: string;
   prompt?: string;
+  signal?: AbortSignal;
 }) {
   const client = makeOpenAI(openaiKey);
   const fs = await import("fs");
@@ -289,14 +293,17 @@ async function transcribeWithWhisperFromPath({
     type: mimeType,
   });
 
-  const whisperResult = (await client.audio.transcriptions.create({
-    file: fileBlob,
-    model: WHISPER_TRANSCRIPTION_MODEL,
-    language: language || undefined,
-    prompt: prompt || undefined,
-    response_format: "verbose_json",
-    timestamp_granularities: ["word", "segment"],
-  })) as any;
+  const whisperResult = (await client.audio.transcriptions.create(
+    {
+      file: fileBlob,
+      model: WHISPER_TRANSCRIPTION_MODEL,
+      language: language || undefined,
+      prompt: prompt || undefined,
+      response_format: "verbose_json",
+      timestamp_granularities: ["word", "segment"],
+    },
+    signal ? { signal } : undefined,
+  )) as any;
 
   const durationFromSegments =
     Array.isArray(whisperResult?.segments) && whisperResult.segments.length > 0
@@ -321,78 +328,6 @@ async function transcribeWithWhisperFromPath({
         ? whisperResult.approx_duration
         : duration,
   };
-}
-
-function resolveTranslationModel({
-  rawModel,
-  modelFamily,
-  messages,
-  canUseAnthropic,
-  translationPhase,
-  qualityMode,
-}: {
-  rawModel?: string;
-  modelFamily?: TranslationModelFamily;
-  messages?: Array<{ role: string; content: string }>;
-  canUseAnthropic: boolean;
-  translationPhase?: "draft" | "review";
-  qualityMode?: boolean;
-}): string {
-  const normalized = normalizeModelId(rawModel || DEFAULT_TRANSLATION_MODEL);
-  const requestedFamily =
-    modelFamily && modelFamily !== "auto" ? modelFamily : undefined;
-  const reviewByHeuristic = isLikelySubtitleReviewMessages(messages);
-  const draftByHeuristic = isLikelySubtitleDraftMessages(messages);
-  const isSubtitleWorkflow =
-    translationPhase === "review" ||
-    translationPhase === "draft" ||
-    reviewByHeuristic ||
-    draftByHeuristic;
-
-  // Non-subtitle traffic keeps caller-selected model (e.g. summarization flows).
-  if (!isSubtitleWorkflow) {
-    return normalized;
-  }
-
-  const effectivePhase =
-    translationPhase === "review"
-      ? "review"
-      : translationPhase === "draft"
-        ? "draft"
-        : qualityMode === false
-          ? "draft"
-          : reviewByHeuristic
-            ? "review"
-            : "draft";
-
-  // Subtitle workflow in Stage5 credit mode is backend-authoritative:
-  // - review => explicit model-family intent (gpt/claude), with Anthropic-aware fallback
-  // - review (no family intent) => auto (Claude Opus when available, else GPT)
-  // - draft => GPT
-  const selectedModel =
-    effectivePhase === "review"
-      ? requestedFamily === "gpt"
-        ? DEFAULT_TRANSLATION_MODEL
-        : requestedFamily === "claude"
-          ? canUseAnthropic
-            ? CLAUDE_OPUS_MODEL
-            : DEFAULT_TRANSLATION_MODEL
-          : canUseAnthropic
-            ? CLAUDE_OPUS_MODEL
-            : DEFAULT_TRANSLATION_MODEL
-      : DEFAULT_TRANSLATION_MODEL;
-
-  if (selectedModel !== normalized) {
-    console.log(
-      `🧭 Server model authority selected ${selectedModel} (requested=${normalized}, phase=${
-        translationPhase ?? effectivePhase
-      }, modelFamily=${modelFamily ?? "auto"}, qualityMode=${
-        typeof qualityMode === "boolean" ? qualityMode : "auto"
-      })`,
-    );
-  }
-
-  return selectedModel;
 }
 
 function mapMessagesToOpenAiResponsesInput(messages: any[]): any[] {
@@ -455,11 +390,13 @@ async function translateWithOpenAiWebSearch({
   messages,
   model,
   apiKey,
+  maxOutputTokens,
   reasoning,
 }: {
   messages: any[];
   model: string;
   apiKey: string;
+  maxOutputTokens?: number;
   reasoning?: { effort?: "low" | "medium" | "high" };
 }): Promise<{
   model: string;
@@ -475,6 +412,9 @@ async function translateWithOpenAiWebSearch({
 
   if (reasoning?.effort) {
     payload.reasoning = { effort: reasoning.effort };
+  }
+  if (Number.isFinite(maxOutputTokens) && Number(maxOutputTokens) > 0) {
+    payload.max_output_tokens = Math.ceil(Number(maxOutputTokens));
   }
 
   const response: any = await client.responses.create(payload);
@@ -503,11 +443,13 @@ async function translateWithClaudeWebSearch({
   messages,
   model,
   apiKey,
+  maxTokens,
   effort,
 }: {
   messages: Array<{ role: string; content: string }>;
   model: string;
   apiKey: string;
+  maxTokens?: number;
   effort?: "low" | "medium" | "high";
 }): Promise<{
   model: string;
@@ -537,9 +479,17 @@ async function translateWithClaudeWebSearch({
   const thinkingBudget =
     effort === "high" ? 16_000 : effort === "medium" ? 8_000 : 0;
   const useExtendedThinking = thinkingBudget > 0;
+  const resolvedMaxTokens =
+    Number.isFinite(maxTokens) && Number(maxTokens) > 0
+      ? Math.ceil(Number(maxTokens))
+      : useExtendedThinking
+        ? 32_000
+        : 16_000;
   const requestParams: any = {
     model,
-    max_tokens: useExtendedThinking ? 32_000 : 16_000,
+    max_tokens: useExtendedThinking
+      ? Math.max(resolvedMaxTokens, thinkingBudget + 1024)
+      : resolvedMaxTokens,
     messages: userMessages,
     tools: [
       {
@@ -691,6 +641,39 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function createAbortError(): Error {
+  const error = new Error("Aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+async function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  if (!signal) {
+    await sleep(ms);
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      signal.removeEventListener("abort", onAbort);
+      reject(createAbortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function extractStatus(error: any): number | null {
   const direct =
     error?.status ?? error?.response?.status ?? error?.cause?.status;
@@ -762,12 +745,14 @@ async function transcribeWithScribeWithRetries({
   languageCode,
   idempotencyKey,
   contextLabel,
+  signal,
 }: {
   filePath: string;
   apiKey: string;
   languageCode: string;
   idempotencyKey?: string;
   contextLabel: string;
+  signal?: AbortSignal;
 }): Promise<{
   result: Awaited<ReturnType<typeof transcribeWithScribe>>;
   attempts: number;
@@ -778,15 +763,20 @@ async function transcribeWithScribeWithRetries({
   for (let attempt = 1; attempt <= SCRIBE_MAX_RETRIES; attempt += 1) {
     attempts = attempt;
     try {
+      throwIfAborted(signal);
       const result = await transcribeWithScribe({
         filePath,
         apiKey,
         languageCode,
         idempotencyKey,
+        signal,
       });
       return { result, attempts };
     } catch (error: any) {
       lastError = error;
+      if (signal?.aborted || error?.name === "AbortError") {
+        break;
+      }
       const retryable = shouldRetrySegmentError(error);
       if (!retryable || attempt >= SCRIBE_MAX_RETRIES) {
         break;
@@ -801,7 +791,7 @@ async function transcribeWithScribeWithRetries({
           error?.message || String(error)
         }`,
       );
-      await sleep(delay);
+      await sleepWithAbort(delay, signal);
     }
   }
 
@@ -846,6 +836,10 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
             qualityMode: payload.qualityMode,
           })
         : normalizeModelId(payload.model || DEFAULT_TRANSLATION_MODEL);
+    const maxCompletionTokens = resolveTranslationReservationMaxCompletionTokens({
+      model,
+      reasoning: payload.mode === "chat" ? payload.reasoning : undefined,
+    });
 
     if (!isAllowedStage5TranslationModel(model)) {
       throw new Error(`Unsupported translation model: ${model}`);
@@ -871,6 +865,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
           messages: messages as any,
           model,
           apiKey: anthropicKey,
+          maxTokens: maxCompletionTokens,
           effort,
         });
         job.result = completion;
@@ -885,6 +880,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
           ],
           model,
           apiKey: anthropicKey,
+          maxTokens: maxCompletionTokens,
         });
         job.result = completion;
       }
@@ -921,6 +917,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
       const request: any = {
         model,
         messages,
+        max_completion_tokens: maxCompletionTokens,
       };
 
       // Chat Completions API uses flat `reasoning_effort` parameter, not nested object
@@ -941,7 +938,11 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
           reasoning?.effort &&
           (status === 400 || msg.includes("reasoning"))
         ) {
-          const reqWithoutReasoning: any = { model, messages };
+          const reqWithoutReasoning: any = {
+            model,
+            messages,
+            max_completion_tokens: maxCompletionTokens,
+          };
           completion =
             await client.chat.completions.create(reqWithoutReasoning);
         } else {
@@ -955,6 +956,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
 
       const request: any = {
         model,
+        max_completion_tokens: maxCompletionTokens,
         messages: [
           {
             role: "system",
@@ -1060,6 +1062,7 @@ const relayRoutesContext: RelayRoutesContext = {
   toWhisperCompatibleScribeResult,
   readJsonBody,
   resolveTranslationModel,
+  resolveTranslationReservationMaxCompletionTokens,
   isAllowedStage5TranslationModel,
   isClaudeModel,
   normalizeModelId,

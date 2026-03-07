@@ -3,10 +3,33 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { IncomingForm } from "formidable";
 import type { RelayRoutesContext } from "./relay-routes.js";
 import {
+  createDirectRequestLease,
+  normalizeRelayRecoveryFailureStatus,
+  persistDirectReplayOrRelease,
+  recoverOrRestartDuplicateReservation,
+  startDirectRequestLeaseHeartbeat,
+} from "./direct-replay-recovery.js";
+import {
+  deleteStoredDirectReplayArtifact,
+  extractStoredDirectReplayResult,
+  materializeStoredDirectReplayResult,
+  storeSuccessDirectReplayArtifact,
+  type DirectReplayResult as SharedDirectReplayResult,
+  type StoredDirectReplayResult,
+} from "./direct-replay-artifacts.js";
+import {
   authorizeRelayDevice,
-  deductRelayCredits,
+  confirmRelayReservation,
+  finalizeRelayCredits,
+  releaseRelayCredits,
+  reserveRelayCredits,
 } from "./relay-billing-client.js";
 import { STAGE5_RELAY_BILLING_SERVICES } from "./relay-billing-contract.js";
+import {
+  getInternalRelayBillingContext,
+} from "./relay-billing-helpers.js";
+import { probeMediaDurationSeconds } from "./audio-probe.js";
+import { buildDirectRelayTranscriptionRequestKey } from "./transcription-idempotency.js";
 
 export async function handleTranscriptionRoutes(
   req: IncomingMessage,
@@ -34,6 +57,248 @@ export async function handleTranscriptionRoutes(
   }
 
   return false;
+}
+
+const TRANSCRIPTION_RESERVE_PADDING_SECONDS = Math.max(
+  0,
+  Number.parseInt(process.env.TRANSCRIPTION_RESERVE_PADDING_SECONDS || "2", 10),
+);
+
+function toReservationSeconds(durationSeconds: number): number {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return 0;
+  }
+  return Math.ceil(durationSeconds) + TRANSCRIPTION_RESERVE_PADDING_SECONDS;
+}
+
+async function probeReservationSecondsFromPath(filePath: string): Promise<number> {
+  const durationSeconds = await probeMediaDurationSeconds(filePath);
+  const reservationSeconds = toReservationSeconds(durationSeconds);
+  if (reservationSeconds <= 0) {
+    throw new Error("Unable to determine a billable audio duration");
+  }
+  return reservationSeconds;
+}
+
+function buildRelayOwnedDirectRequestOwnership(): {
+  directRequestOwnership: {
+    version: 1;
+    state: "relay-owned";
+    updatedAt: string;
+  };
+} {
+  return {
+    directRequestOwnership: {
+      version: 1,
+      state: "relay-owned",
+      updatedAt: new Date().toISOString(),
+    },
+  };
+}
+
+type DirectTranscriptionReplayResult = SharedDirectReplayResult;
+
+type DirectTranscriptionReplayEntry = {
+  done: boolean;
+  promise: Promise<DirectTranscriptionReplayResult>;
+  resolve: (result: DirectTranscriptionReplayResult) => void;
+  result?: DirectTranscriptionReplayResult;
+  expiresAt?: number;
+};
+
+type PendingDirectTranscriptionFinalize = {
+  seconds: number;
+  model: string;
+};
+
+const DIRECT_TRANSCRIPTION_REPLAY_TTL_MS = Math.max(
+  1_000,
+  Number.parseInt(
+    process.env.DIRECT_TRANSCRIPTION_REPLAY_TTL_MS || String(10 * 60 * 1_000),
+    10,
+  ),
+);
+const directTranscriptionReplayCache = new Map<
+  string,
+  DirectTranscriptionReplayEntry
+>();
+
+function createDirectTranscriptionReplayEntry(): DirectTranscriptionReplayEntry {
+  let resolve!: (result: DirectTranscriptionReplayResult) => void;
+  const promise = new Promise<DirectTranscriptionReplayResult>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return {
+    done: false,
+    promise,
+    resolve,
+  };
+}
+
+function pruneDirectTranscriptionReplayCache(now = Date.now()): void {
+  for (const [requestKey, entry] of directTranscriptionReplayCache.entries()) {
+    if (
+      entry.done &&
+      entry.result?.kind === "success" &&
+      typeof entry.expiresAt === "number" &&
+      entry.expiresAt <= now
+    ) {
+      directTranscriptionReplayCache.delete(requestKey);
+    }
+  }
+}
+
+function settleDirectTranscriptionReplayEntry({
+  requestKey,
+  entry,
+  result,
+  cacheSuccess = false,
+}: {
+  requestKey: string;
+  entry: DirectTranscriptionReplayEntry;
+  result: DirectTranscriptionReplayResult;
+  cacheSuccess?: boolean;
+}): void {
+  if (entry.done) {
+    return;
+  }
+
+  entry.done = true;
+  entry.result = result;
+  entry.resolve(result);
+
+  if (cacheSuccess && result.kind === "success") {
+    entry.expiresAt = Date.now() + DIRECT_TRANSCRIPTION_REPLAY_TTL_MS;
+    directTranscriptionReplayCache.set(requestKey, entry);
+    return;
+  }
+
+  directTranscriptionReplayCache.delete(requestKey);
+}
+
+function sendDirectTranscriptionReplay(
+  res: ServerResponse,
+  replay: DirectTranscriptionReplayResult,
+  sendError: RelayRoutesContext["sendError"],
+  sendJson: RelayRoutesContext["sendJson"],
+): void {
+  if (replay.kind === "success") {
+    sendJson(res, replay.data, replay.status);
+    return;
+  }
+
+  sendError(res, replay.status, replay.error, replay.details);
+}
+
+function asObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function extractStoredDirectTranscriptionReplay(
+  reservationMeta: unknown,
+): StoredDirectReplayResult | null {
+  return extractStoredDirectReplayResult(
+    reservationMeta,
+    "Transcription failed",
+  );
+}
+
+function buildStoredDirectTranscriptionReplayMeta(
+  storedReplay: StoredDirectReplayResult | null,
+): Record<string, unknown> {
+  if (!storedReplay) {
+    return {};
+  }
+  return {
+    directReplayResult: storedReplay,
+  };
+}
+
+function extractPendingDirectTranscriptionFinalize(
+  reservationMeta: unknown,
+): PendingDirectTranscriptionFinalize | null {
+  const metaObject = asObject(reservationMeta);
+  const pendingObject = asObject(metaObject?.pendingFinalize);
+  if (!pendingObject) {
+    return null;
+  }
+
+  const seconds = Number(pendingObject.seconds);
+  const model =
+    typeof pendingObject.model === "string" ? pendingObject.model.trim() : "";
+  if (!model || !Number.isFinite(seconds) || seconds < 0) {
+    return null;
+  }
+
+  return { seconds, model };
+}
+
+async function recoverReservedDirectTranscriptionReplay({
+  cfApiBase,
+  relaySecret,
+  deviceId,
+  requestKey,
+  reservationMeta,
+}: {
+  cfApiBase: string;
+  relaySecret: string;
+  deviceId: string;
+  requestKey: string;
+  reservationMeta: unknown;
+}): Promise<
+  | { kind: "replay"; replay: DirectTranscriptionReplayResult }
+  | { kind: "error"; status: number; error: string; details?: string }
+  | null
+> {
+  const storedReplay = extractStoredDirectTranscriptionReplay(reservationMeta);
+  const replay = await materializeStoredDirectReplayResult({
+    cfApiBase,
+    relaySecret,
+    storedReplay,
+  });
+  const pendingFinalize = extractPendingDirectTranscriptionFinalize(
+    reservationMeta,
+  );
+  if (!storedReplay || !replay || !pendingFinalize) {
+    return null;
+  }
+  if (replay.kind !== "success") {
+    return {
+      kind: "error",
+      status: replay.status,
+      error: replay.error,
+      ...(replay.details ? { details: replay.details } : {}),
+    };
+  }
+
+  const finalizeResult = await finalizeRelayCredits({
+    cfApiBase,
+    relaySecret,
+    payload: {
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+      seconds: pendingFinalize.seconds,
+      model: pendingFinalize.model,
+      meta: {
+        ...buildStoredDirectTranscriptionReplayMeta(storedReplay),
+        pendingFinalize: null,
+      },
+    },
+  });
+
+  if (!finalizeResult.ok) {
+    return {
+      kind: "error",
+      status: normalizeRelayRecoveryFailureStatus(finalizeResult.status),
+      error: finalizeResult.error || "Credit finalize failed",
+    };
+  }
+
+  return { kind: "replay", replay };
 }
 
 async function handleTranscribe(
@@ -66,8 +331,34 @@ async function handleTranscribe(
     return;
   }
 
+  const internalBilling = getInternalRelayBillingContext(req, getHeader);
+  if (!internalBilling) {
+    sendError(res, 401, "Unauthorized - missing Stage5 billing context");
+    return;
+  }
+  const confirmResult = await confirmRelayReservation({
+    cfApiBase: CF_API_BASE,
+    relaySecret: RELAY_SECRET,
+    payload: {
+      deviceId: internalBilling.deviceId,
+      requestKey: internalBilling.requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+    },
+  });
+  if (!confirmResult.ok) {
+    sendError(res, confirmResult.status, confirmResult.error || "Reservation confirmation failed");
+    return;
+  }
+
   const idempotencyKey =
     getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
+
+  let requestClosed = false;
+  const requestAbortController = new AbortController();
+  req.on("close", () => {
+    requestClosed = true;
+    requestAbortController.abort();
+  });
 
   console.log("🎯 Relay secret validated, processing transcription...");
 
@@ -122,8 +413,7 @@ async function handleTranscribe(
     );
 
     const openaiKey = getHeader(req, "x-openai-key");
-    const elevenLabsKey =
-      getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+    const elevenLabsKey = getHeader(req, "x-elevenlabs-key");
 
     let effectiveHighQuality = useHighQuality;
     if (effectiveHighQuality && !elevenLabsKey && openaiKey) {
@@ -131,6 +421,44 @@ async function handleTranscribe(
       console.warn(
         "⚠️ ElevenLabs key missing for high-quality /transcribe; falling back to Whisper.",
       );
+    }
+
+    let reservationSeconds: number;
+    try {
+      reservationSeconds = await probeReservationSecondsFromPath(file.filepath);
+    } catch (probeError: any) {
+      sendError(
+        res,
+        422,
+        "Unable to determine audio duration for billing",
+        probeError?.message || String(probeError),
+      );
+      return;
+    }
+
+    // Worker-side reservations are only provisional. Probe the uploaded media
+    // here and top up to the actual duration before any vendor call starts.
+    const exactConfirmResult = await confirmRelayReservation({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      payload: {
+        deviceId: internalBilling.deviceId,
+        requestKey: internalBilling.requestKey,
+        service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+        seconds: reservationSeconds,
+        model: effectiveHighQuality
+          ? ELEVENLABS_TRANSCRIPTION_MODEL
+          : WHISPER_TRANSCRIPTION_MODEL,
+        meta: buildRelayOwnedDirectRequestOwnership(),
+      },
+    });
+    if (!exactConfirmResult.ok) {
+      sendError(
+        res,
+        exactConfirmResult.status,
+        exactConfirmResult.error || "Reservation confirmation failed",
+      );
+      return;
     }
 
     if (effectiveHighQuality) {
@@ -147,6 +475,7 @@ async function handleTranscribe(
             languageCode: language || "auto",
             idempotencyKey,
             contextLabel: "/transcribe",
+            signal: requestAbortController.signal,
           });
         const whisperFormat = toWhisperCompatibleScribeResult(scribeResult);
         if (attempts > 1) {
@@ -157,8 +486,16 @@ async function handleTranscribe(
         }
 
         console.log("🎯 Relay transcription completed with ElevenLabs.");
+        if (requestClosed) {
+          console.warn("⚠️ /transcribe client disconnected after ElevenLabs success");
+          return;
+        }
         sendJson(res, whisperFormat);
       } catch (scribeError: any) {
+        if (requestClosed || requestAbortController.signal.aborted) {
+          console.warn("⚠️ /transcribe client disconnected during ElevenLabs transcription");
+          return;
+        }
         if (!openaiKey) {
           throw scribeError;
         }
@@ -190,7 +527,12 @@ async function handleTranscribe(
           mimeType: file.mimetype || "audio/webm",
           language: language || undefined,
           prompt: prompt || undefined,
+          signal: requestAbortController.signal,
         });
+        if (requestClosed) {
+          console.warn("⚠️ /transcribe client disconnected after Whisper fallback success");
+          return;
+        }
         sendJson(res, {
           ...transcription,
           fallback: {
@@ -223,12 +565,21 @@ async function handleTranscribe(
         mimeType: file.mimetype || "audio/webm",
         language: language || undefined,
         prompt: prompt || undefined,
+        signal: requestAbortController.signal,
       });
 
       console.log("🎯 Relay transcription completed with Whisper.");
+      if (requestClosed) {
+        console.warn("⚠️ /transcribe client disconnected after Whisper success");
+        return;
+      }
       sendJson(res, transcription);
     }
   } catch (error: any) {
+    if (requestClosed || requestAbortController.signal.aborted) {
+      console.warn("⚠️ /transcribe aborted by upstream client");
+      return;
+    }
     console.error("❌ Relay transcription error:", error.message);
     sendError(res, 500, "Transcription failed", error.message);
   }
@@ -244,7 +595,9 @@ async function handleTranscribeElevenLabs(
   console.log("📡 Processing ElevenLabs Scribe transcription request...");
 
   const {
+    CF_API_BASE,
     RELAY_SECRET,
+    ELEVENLABS_TRANSCRIPTION_MODEL,
     getHeader,
     sendError,
     sendJson,
@@ -260,11 +613,36 @@ async function handleTranscribeElevenLabs(
     return;
   }
 
+  const internalBilling = getInternalRelayBillingContext(req, getHeader);
+  if (!internalBilling) {
+    sendError(res, 401, "Unauthorized - missing Stage5 billing context");
+    return;
+  }
+  const confirmResult = await confirmRelayReservation({
+    cfApiBase: CF_API_BASE,
+    relaySecret: RELAY_SECRET,
+    payload: {
+      deviceId: internalBilling.deviceId,
+      requestKey: internalBilling.requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+    },
+  });
+  if (!confirmResult.ok) {
+    sendError(res, confirmResult.status, confirmResult.error || "Reservation confirmation failed");
+    return;
+  }
+
   const idempotencyKey =
     getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
 
-  const elevenLabsKey =
-    getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+  let requestClosed = false;
+  const requestAbortController = new AbortController();
+  req.on("close", () => {
+    requestClosed = true;
+    requestAbortController.abort();
+  });
+
+  const elevenLabsKey = getHeader(req, "x-elevenlabs-key");
   if (!elevenLabsKey) {
     console.log("❌ ElevenLabs API key not provided");
     sendError(res, 500, "ElevenLabs not configured");
@@ -289,6 +667,42 @@ async function handleTranscribeElevenLabs(
       ? fields.language[0]
       : fields.language;
 
+    let reservationSeconds: number;
+    try {
+      reservationSeconds = await probeReservationSecondsFromPath(file.filepath);
+    } catch (probeError: any) {
+      sendError(
+        res,
+        422,
+        "Unable to determine audio duration for billing",
+        probeError?.message || String(probeError),
+      );
+      return;
+    }
+
+    // Direct relay transcription also settles the duration estimate to the
+    // probed media length before starting vendor work.
+    const exactConfirmResult = await confirmRelayReservation({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      payload: {
+        deviceId: internalBilling.deviceId,
+        requestKey: internalBilling.requestKey,
+        service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+        seconds: reservationSeconds,
+        model: ELEVENLABS_TRANSCRIPTION_MODEL,
+        meta: buildRelayOwnedDirectRequestOwnership(),
+      },
+    });
+    if (!exactConfirmResult.ok) {
+      sendError(
+        res,
+        exactConfirmResult.status,
+        exactConfirmResult.error || "Reservation confirmation failed",
+      );
+      return;
+    }
+
     console.log(
       `🎵 Transcribing with ElevenLabs Scribe: ${file.originalFilename} (${(
         file.size /
@@ -302,12 +716,21 @@ async function handleTranscribeElevenLabs(
       apiKey: elevenLabsKey,
       languageCode: language || "auto",
       idempotencyKey,
+      signal: requestAbortController.signal,
     });
     const whisperFormat = toWhisperCompatibleScribeResult(result);
 
     console.log(`🎯 ElevenLabs Scribe transcription completed!`);
+    if (requestClosed) {
+      console.warn("⚠️ /transcribe-elevenlabs client disconnected after success");
+      return;
+    }
     sendJson(res, whisperFormat);
   } catch (error: any) {
+    if (requestClosed || requestAbortController.signal.aborted) {
+      console.warn("⚠️ /transcribe-elevenlabs aborted by upstream client");
+      return;
+    }
     console.error("❌ ElevenLabs Scribe error:", error.message);
     sendError(res, 500, "Transcription failed", error.message);
   }
@@ -347,6 +770,7 @@ async function handleTranscribeDirect(
   // Stable idempotency key from the app to prevent double billing on retries.
   const idempotencyKey =
     getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
+  const appVersion = getHeader(req, "x-stage5-app-version");
 
   // Step 1: Authorize with CF Worker
   console.log(`🔐 Authorizing with CF Worker...`);
@@ -355,6 +779,9 @@ async function handleTranscribeDirect(
     cfApiBase: CF_API_BASE,
     relaySecret: RELAY_SECRET,
     apiKey,
+    service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+    clientIdempotencyKey: idempotencyKey,
+    appVersion,
   });
   if (!authResult.ok) {
     console.log(`❌ Authorization failed: ${authResult.status}`);
@@ -371,6 +798,10 @@ async function handleTranscribeDirect(
   );
 
   // Step 2: Parse and transcribe the file
+  let replayContext:
+    | { requestKey: string; entry: DirectTranscriptionReplayEntry }
+    | null = null;
+  let stopLeaseHeartbeat: (() => void) | null = null;
   try {
     const form = new IncomingForm({
       maxFileSize: 500 * 1024 * 1024, // 500MB
@@ -431,59 +862,360 @@ async function handleTranscribeDirect(
       );
     }
 
-    let transcriptionResult: any;
-    let billedModel: string;
+    let reservationSeconds: number;
+    try {
+      reservationSeconds = await probeReservationSecondsFromPath(file.filepath);
+    } catch (probeError: any) {
+      sendError(
+        res,
+        422,
+        "Unable to determine audio duration for billing",
+        probeError?.message || String(probeError),
+      );
+      return;
+    }
 
-    if (effectiveHighQuality) {
-      if (!elevenLabsKey) {
-        sendError(res, 500, "ElevenLabs not configured");
+    const requestKey = await buildDirectRelayTranscriptionRequestKey({
+      deviceId,
+      clientIdempotencyKey: idempotencyKey,
+      filePath: file.filepath,
+      language: language || null,
+      prompt: prompt || null,
+      modelHint: typeof modelHint === "string" ? modelHint : null,
+      modelIdHint: typeof modelIdHint === "string" ? modelIdHint : null,
+      qualityMode: typeof qualityModeRaw === "string" ? qualityModeRaw : null,
+    });
+    pruneDirectTranscriptionReplayCache();
+    const existingReplay = directTranscriptionReplayCache.get(requestKey);
+    if (existingReplay) {
+      const replay = existingReplay.result ?? await existingReplay.promise;
+      sendDirectTranscriptionReplay(res, replay, sendError, sendJson);
+      return;
+    }
+
+    const replayEntry = createDirectTranscriptionReplayEntry();
+    directTranscriptionReplayCache.set(requestKey, replayEntry);
+    replayContext = { requestKey, entry: replayEntry };
+    const sendReplaySuccess = (data: unknown, status = 200): void => {
+      const replay: DirectTranscriptionReplayResult = {
+        kind: "success",
+        status,
+        data,
+      };
+      settleDirectTranscriptionReplayEntry({
+        requestKey,
+        entry: replayEntry,
+        result: replay,
+        cacheSuccess: true,
+      });
+      sendDirectTranscriptionReplay(res, replay, sendError, sendJson);
+    };
+    const sendReplayError = (
+      status: number,
+      error: string,
+      details?: string,
+    ): void => {
+      const replay: DirectTranscriptionReplayResult = {
+        kind: "error",
+        status,
+        error,
+        ...(details ? { details } : {}),
+      };
+      settleDirectTranscriptionReplayEntry({
+        requestKey,
+        entry: replayEntry,
+        result: replay,
+      });
+      sendDirectTranscriptionReplay(res, replay, sendError, sendJson);
+    };
+
+    const directRequestLease = createDirectRequestLease();
+    let reserveResult: Awaited<ReturnType<typeof reserveRelayCredits>> | null = null;
+    for (let orphanRecoveryAttempt = 0; orphanRecoveryAttempt < 2; orphanRecoveryAttempt += 1) {
+      reserveResult = await reserveRelayCredits({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        payload: {
+          deviceId,
+          requestKey,
+          service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+          seconds: reservationSeconds,
+          model: effectiveHighQuality
+            ? ELEVENLABS_TRANSCRIPTION_MODEL
+            : WHISPER_TRANSCRIPTION_MODEL,
+          meta: {
+            directRequestLease,
+          },
+        },
+      });
+      if (!reserveResult.ok) {
+        sendReplayError(
+          reserveResult.status === 402 ? 402 : reserveResult.status,
+          reserveResult.error || "Credit reservation failed",
+        );
         return;
       }
+      if (reserveResult.status !== "duplicate") {
+        break;
+      }
 
-      try {
-        const { result, attempts } = await transcribeWithScribeWithRetries({
-          filePath: file.filepath,
-          apiKey: elevenLabsKey,
-          languageCode: language || "auto",
-          idempotencyKey,
-          contextLabel: "/transcribe-direct",
+      if (reserveResult.reservationStatus === "reserved") {
+        const recovered = await recoverReservedDirectTranscriptionReplay({
+          cfApiBase: CF_API_BASE,
+          relaySecret: RELAY_SECRET,
+          deviceId,
+          requestKey,
+          reservationMeta: reserveResult.reservationMeta,
         });
-        transcriptionResult = toWhisperCompatibleScribeResult(result);
-        if (attempts > 1) {
-          transcriptionResult = {
-            ...transcriptionResult,
-            retry: {
-              provider: ELEVENLABS_TRANSCRIPTION_MODEL,
-              attempts,
-            },
-          };
-        }
-        billedModel = ELEVENLABS_TRANSCRIPTION_MODEL;
-      } catch (scribeError: any) {
-        if (!openaiKey) {
-          throw scribeError;
-        }
-
-        const attempts =
-          Number((scribeError as any)?.scribeAttempts) || SCRIBE_MAX_RETRIES;
-        if (whisperSizeGuardMessage) {
-          const reason = scribeError?.message || String(scribeError);
-          console.warn(
-            `⚠️ /transcribe-direct cannot fall back to Whisper after ${attempts} ElevenLabs attempts: ${whisperSizeGuardMessage}`,
-          );
-          sendError(
+        if (recovered?.kind === "replay") {
+          settleDirectTranscriptionReplayEntry({
+            requestKey,
+            entry: replayEntry,
+            result: recovered.replay,
+            cacheSuccess: recovered.replay.kind === "success",
+          });
+          sendDirectTranscriptionReplay(
             res,
-            502,
-            "ElevenLabs transcription failed and Whisper fallback is unavailable for this file size",
-            `${reason}. ${whisperSizeGuardMessage}`,
+            recovered.replay,
+            sendError,
+            sendJson,
           );
           return;
         }
-        console.warn(
-          `⚠️ /transcribe-direct falling back to Whisper after ${attempts} ElevenLabs attempts: ${
-            scribeError?.message || String(scribeError)
-          }`,
+        if (recovered?.kind === "error") {
+          sendReplayError(
+            recovered.status,
+            recovered.error,
+            recovered.details,
+          );
+          return;
+        }
+
+        const orphanRecovery = await recoverOrRestartDuplicateReservation({
+          cfApiBase: CF_API_BASE,
+          relaySecret: RELAY_SECRET,
+          deviceId,
+          requestKey,
+          service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+          reservationMeta: reserveResult.reservationMeta,
+          reservationUpdatedAt: reserveResult.reservationUpdatedAt,
+        });
+        if (!orphanRecovery.ok) {
+          sendReplayError(
+            orphanRecovery.status,
+            orphanRecovery.error,
+            orphanRecovery.details,
+          );
+          return;
+        }
+        if (orphanRecovery.action === "reservation-settled") {
+          const settledReplay = await materializeStoredDirectReplayResult({
+            cfApiBase: CF_API_BASE,
+            relaySecret: RELAY_SECRET,
+            storedReplay: extractStoredDirectTranscriptionReplay(
+              orphanRecovery.reservationMeta,
+            ),
+          });
+          if (settledReplay?.kind === "success") {
+            settleDirectTranscriptionReplayEntry({
+              requestKey,
+              entry: replayEntry,
+              result: settledReplay,
+              cacheSuccess: true,
+            });
+            sendDirectTranscriptionReplay(
+              res,
+              settledReplay,
+              sendError,
+              sendJson,
+            );
+            return;
+          }
+          if (settledReplay?.kind === "error") {
+            sendReplayError(
+              settledReplay.status,
+              settledReplay.error,
+              settledReplay.details,
+            );
+            return;
+          }
+          sendReplayError(409, "Duplicate request already completed");
+          return;
+        }
+        if (orphanRecovery.action === "retry-reserve") {
+          continue;
+        }
+      }
+
+      const persistedReplay = await materializeStoredDirectReplayResult({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        storedReplay: extractStoredDirectTranscriptionReplay(
+          reserveResult.reservationMeta,
+        ),
+      });
+      if (persistedReplay?.kind === "success") {
+        settleDirectTranscriptionReplayEntry({
+          requestKey,
+          entry: replayEntry,
+          result: persistedReplay,
+          cacheSuccess: true,
+        });
+        sendDirectTranscriptionReplay(
+          res,
+          persistedReplay,
+          sendError,
+          sendJson,
         );
+        return;
+      }
+      if (persistedReplay?.kind === "error") {
+        sendReplayError(
+          persistedReplay.status,
+          persistedReplay.error,
+          persistedReplay.details,
+        );
+        return;
+      }
+
+      sendReplayError(409, "Duplicate request");
+      return;
+    }
+    if (!reserveResult || !reserveResult.ok || reserveResult.status === "duplicate") {
+      sendReplayError(500, "Credit reservation failed");
+      return;
+    }
+    stopLeaseHeartbeat = startDirectRequestLeaseHeartbeat({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+      lease: directRequestLease,
+    });
+
+    let transcriptionResult: any;
+    let billedModel: string;
+
+    try {
+      if (effectiveHighQuality) {
+        if (!elevenLabsKey) {
+          await releaseRelayCredits({
+            cfApiBase: CF_API_BASE,
+            relaySecret: RELAY_SECRET,
+            payload: {
+              deviceId,
+              requestKey,
+              service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+            },
+          });
+          sendReplayError(500, "ElevenLabs not configured");
+          return;
+        }
+
+        try {
+          const { result, attempts } = await transcribeWithScribeWithRetries({
+            filePath: file.filepath,
+            apiKey: elevenLabsKey,
+            languageCode: language || "auto",
+            idempotencyKey,
+            contextLabel: "/transcribe-direct",
+          });
+          transcriptionResult = toWhisperCompatibleScribeResult(result);
+          if (attempts > 1) {
+            transcriptionResult = {
+              ...transcriptionResult,
+              retry: {
+                provider: ELEVENLABS_TRANSCRIPTION_MODEL,
+                attempts,
+              },
+            };
+          }
+          billedModel = ELEVENLABS_TRANSCRIPTION_MODEL;
+        } catch (scribeError: any) {
+          if (!openaiKey) {
+            throw scribeError;
+          }
+
+          const attempts =
+            Number((scribeError as any)?.scribeAttempts) || SCRIBE_MAX_RETRIES;
+          if (whisperSizeGuardMessage) {
+            const reason = scribeError?.message || String(scribeError);
+            console.warn(
+              `⚠️ /transcribe-direct cannot fall back to Whisper after ${attempts} ElevenLabs attempts: ${whisperSizeGuardMessage}`,
+            );
+            await releaseRelayCredits({
+              cfApiBase: CF_API_BASE,
+              relaySecret: RELAY_SECRET,
+              payload: {
+                deviceId,
+                requestKey,
+                service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+              },
+            });
+            sendReplayError(
+              502,
+              "ElevenLabs transcription failed and Whisper fallback is unavailable for this file size",
+              `${reason}. ${whisperSizeGuardMessage}`,
+            );
+            return;
+          }
+          console.warn(
+            `⚠️ /transcribe-direct falling back to Whisper after ${attempts} ElevenLabs attempts: ${
+              scribeError?.message || String(scribeError)
+            }`,
+          );
+
+          transcriptionResult = await transcribeWithWhisperFromPath({
+            openaiKey,
+            filePath: file.filepath,
+            fileName: file.originalFilename || "audio.webm",
+            mimeType: file.mimetype || "audio/webm",
+            language: language || undefined,
+            prompt: prompt || undefined,
+          });
+          transcriptionResult = {
+            ...transcriptionResult,
+            fallback: {
+              from: ELEVENLABS_TRANSCRIPTION_MODEL,
+              to: WHISPER_TRANSCRIPTION_MODEL,
+              attempts,
+              reason: scribeError?.message || String(scribeError),
+            },
+          };
+          billedModel = WHISPER_TRANSCRIPTION_MODEL;
+        }
+      } else {
+        if (!openaiKey) {
+          await releaseRelayCredits({
+            cfApiBase: CF_API_BASE,
+            relaySecret: RELAY_SECRET,
+            payload: {
+              deviceId,
+              requestKey,
+              service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+            },
+          });
+          sendReplayError(500, "OpenAI not configured");
+          return;
+        }
+        if (whisperSizeGuardMessage) {
+          await releaseRelayCredits({
+            cfApiBase: CF_API_BASE,
+            relaySecret: RELAY_SECRET,
+            payload: {
+              deviceId,
+              requestKey,
+              service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+            },
+          });
+          sendReplayError(
+            413,
+            "File too large for Whisper transcription",
+            whisperSizeGuardMessage,
+          );
+          return;
+        }
 
         transcriptionResult = await transcribeWithWhisperFromPath({
           openaiKey,
@@ -493,41 +1225,20 @@ async function handleTranscribeDirect(
           language: language || undefined,
           prompt: prompt || undefined,
         });
-        transcriptionResult = {
-          ...transcriptionResult,
-          fallback: {
-            from: ELEVENLABS_TRANSCRIPTION_MODEL,
-            to: WHISPER_TRANSCRIPTION_MODEL,
-            attempts,
-            reason: scribeError?.message || String(scribeError),
-          },
-        };
         billedModel = WHISPER_TRANSCRIPTION_MODEL;
       }
-    } else {
-      if (!openaiKey) {
-        sendError(res, 500, "OpenAI not configured");
-        return;
-      }
-      if (whisperSizeGuardMessage) {
-        sendError(
-          res,
-          413,
-          "File too large for Whisper transcription",
-          whisperSizeGuardMessage,
-        );
-        return;
-      }
-
-      transcriptionResult = await transcribeWithWhisperFromPath({
-        openaiKey,
-        filePath: file.filepath,
-        fileName: file.originalFilename || "audio.webm",
-        mimeType: file.mimetype || "audio/webm",
-        language: language || undefined,
-        prompt: prompt || undefined,
+    } catch (transcriptionError: any) {
+      await releaseRelayCredits({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        payload: {
+          deviceId,
+          requestKey,
+          service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+          meta: { reason: "vendor-error", message: transcriptionError?.message || String(transcriptionError) },
+        },
       });
-      billedModel = WHISPER_TRANSCRIPTION_MODEL;
+      throw transcriptionError;
     }
 
     const durationForBilling =
@@ -543,42 +1254,114 @@ async function handleTranscribeDirect(
       `🎯 Transcription completed! Duration: ${durationForBilling.toFixed(1)}s model=${billedModel}`,
     );
 
-    // Step 3: Deduct credits
-    console.log(
-      `💳 Deducting credits for ${Math.ceil(durationForBilling)}s...`,
-    );
+    const replaySuccess: DirectTranscriptionReplayResult = {
+      kind: "success",
+      status: 200,
+      data: transcriptionResult,
+    };
+    const pendingFinalize: PendingDirectTranscriptionFinalize = {
+      seconds: durationForBilling,
+      model: billedModel,
+    };
+    const storedReplayResult = await storeSuccessDirectReplayArtifact({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+      replay: replaySuccess,
+    });
+    if (!storedReplayResult.ok) {
+      sendReplayError(
+        storedReplayResult.status,
+        storedReplayResult.error || "Replay persistence failed",
+      );
+      return;
+    }
+    const persistResult = await persistDirectReplayOrRelease({
+      cfApiBase: CF_API_BASE,
+      relaySecret: RELAY_SECRET,
+      deviceId,
+      requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+      replayResult: storedReplayResult.storedReplay,
+      pendingFinalize,
+    });
+    if (!persistResult.ok) {
+      await deleteStoredDirectReplayArtifact({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        storedReplay: storedReplayResult.storedReplay,
+      });
+      sendReplayError(
+        persistResult.status,
+        persistResult.error || "Replay persistence failed",
+        persistResult.details,
+      );
+      return;
+    }
+    stopLeaseHeartbeat?.();
+    stopLeaseHeartbeat = null;
+
+    console.log(`💳 Finalizing credits for ${Math.ceil(durationForBilling)}s...`);
     try {
-      const deductResult = await deductRelayCredits({
+      const finalizeResult = await finalizeRelayCredits({
         cfApiBase: CF_API_BASE,
         relaySecret: RELAY_SECRET,
         payload: {
           deviceId,
+          requestKey,
           service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
           seconds: durationForBilling,
           model: billedModel,
-          ...(idempotencyKey ? { idempotencyKey } : {}),
+          meta: {
+            ...buildStoredDirectTranscriptionReplayMeta(
+              storedReplayResult.storedReplay,
+            ),
+            pendingFinalize: null,
+          },
         },
       });
 
-      if (!deductResult.ok) {
-        console.error(`❌ Credit deduction failed: ${deductResult.status}`);
-        const status = deductResult.status === 402 ? 402 : 500;
-        sendError(res, status, deductResult.error || "Credit deduction failed");
+      if (!finalizeResult.ok) {
+        console.error(`❌ Credit finalize failed: ${finalizeResult.status}`);
+        sendReplayError(
+          normalizeRelayRecoveryFailureStatus(finalizeResult.status),
+          finalizeResult.error || "Credit finalize failed",
+        );
         return;
       }
 
-      console.log(`✅ Credits deducted successfully`);
+      console.log(`✅ Credits finalized successfully`);
     } catch (deductErr: any) {
-      console.error("❌ Credit deduction request failed:", deductErr.message);
-      sendError(res, 500, "Credit deduction failed", deductErr?.message);
+      console.error("❌ Credit finalize request failed:", deductErr.message);
+      sendReplayError(500, "Credit finalize failed", deductErr?.message);
       return;
     }
 
     // Return result to app (only after successful deduction)
-    sendJson(res, transcriptionResult);
+    sendReplaySuccess(transcriptionResult);
   } catch (error: any) {
     console.error("❌ Transcription error:", error.message);
+    if (replayContext) {
+      const replay: DirectTranscriptionReplayResult = {
+        kind: "error",
+        status: 500,
+        error: "Transcription failed",
+        details: error.message,
+      };
+      settleDirectTranscriptionReplayEntry({
+        requestKey: replayContext.requestKey,
+        entry: replayContext.entry,
+        result: replay,
+      });
+      sendDirectTranscriptionReplay(res, replay, sendError, sendJson);
+      return;
+    }
+
     sendError(res, 500, "Transcription failed", error.message);
+  } finally {
+    stopLeaseHeartbeat?.();
   }
 }
 
@@ -592,6 +1375,7 @@ async function handleTranscribeFromR2(
   console.log("📡 Processing ElevenLabs Scribe from R2 URL...");
 
   const {
+    CF_API_BASE,
     RELAY_SECRET,
     R2_FETCH_TIMEOUT_MS,
     getHeader,
@@ -609,19 +1393,34 @@ async function handleTranscribeFromR2(
     return;
   }
 
+  const internalBilling = getInternalRelayBillingContext(req, getHeader);
+  if (!internalBilling) {
+    sendError(res, 401, "Unauthorized - missing Stage5 billing context");
+    return;
+  }
+  const confirmResult = await confirmRelayReservation({
+    cfApiBase: CF_API_BASE,
+    relaySecret: RELAY_SECRET,
+    payload: {
+      deviceId: internalBilling.deviceId,
+      requestKey: internalBilling.requestKey,
+      service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+    },
+  });
+  if (!confirmResult.ok) {
+    sendError(res, confirmResult.status, confirmResult.error || "Reservation confirmation failed");
+    return;
+  }
+
   const idempotencyKey =
     getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
 
-  const elevenLabsKey =
-    getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+  const elevenLabsKey = getHeader(req, "x-elevenlabs-key");
   if (!elevenLabsKey) {
     console.log("❌ ElevenLabs API key not provided");
     sendError(res, 500, "ElevenLabs not configured");
     return;
   }
-
-  // Capture relay secret for webhook callback
-  const relaySecret = getHeader(req, "x-relay-secret") || "";
 
   try {
     // Parse JSON body
@@ -629,10 +1428,14 @@ async function handleTranscribeFromR2(
     for await (const chunk of req) {
       body += chunk;
     }
-    const { r2Url, language, webhookUrl } = JSON.parse(body);
+    const { r2Url, language, webhookUrl, webhookToken } = JSON.parse(body);
 
     if (!r2Url) {
       sendError(res, 400, "r2Url is required");
+      return;
+    }
+    if (webhookUrl && !String(webhookToken || "").trim()) {
+      sendError(res, 400, "webhookToken is required when webhookUrl is provided");
       return;
     }
 
@@ -681,6 +1484,24 @@ async function handleTranscribeFromR2(
       await fs.promises.writeFile(tempFile, audioBuffer);
 
       try {
+        const reservationSeconds = await probeReservationSecondsFromPath(tempFile);
+        const exactConfirmResult = await confirmRelayReservation({
+          cfApiBase: CF_API_BASE,
+          relaySecret: RELAY_SECRET,
+          payload: {
+            deviceId: internalBilling.deviceId,
+            requestKey: internalBilling.requestKey,
+            service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+            seconds: reservationSeconds,
+            model: ctx.ELEVENLABS_TRANSCRIPTION_MODEL,
+          },
+        });
+        if (!exactConfirmResult.ok) {
+          throw new Error(
+            exactConfirmResult.error || "Reservation confirmation failed"
+          );
+        }
+
         const result = await transcribeWithScribe({
           filePath: tempFile,
           apiKey: elevenLabsKey,
@@ -727,7 +1548,8 @@ async function handleTranscribeFromR2(
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
-                "X-Relay-Secret": relaySecret,
+                "X-Relay-Secret": RELAY_SECRET,
+                "X-Stage5-Webhook-Token": String(webhookToken || ""),
               },
               body: JSON.stringify({ success: true, result }),
             });
@@ -750,7 +1572,8 @@ async function handleTranscribeFromR2(
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
-                "X-Relay-Secret": relaySecret,
+                "X-Relay-Secret": RELAY_SECRET,
+                "X-Stage5-Webhook-Token": String(webhookToken || ""),
               },
               body: JSON.stringify({ success: false, error: error.message }),
             });

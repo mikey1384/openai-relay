@@ -69,11 +69,16 @@ export async function translateWithClaude({
   // Determine if extended thinking should be enabled
   const budgetTokens = effort ? THINKING_BUDGET[effort] : 0;
   const useExtendedThinking = budgetTokens > 0;
+  const resolvedMaxTokens = useExtendedThinking
+    ? Math.max(maxTokens, budgetTokens + 1024)
+    : maxTokens;
 
   // Build request parameters
   const requestParams: any = {
     model,
-    max_tokens: useExtendedThinking ? MAX_TOKENS_WITH_THINKING : maxTokens,
+    max_tokens: useExtendedThinking
+      ? Math.min(MAX_TOKENS_WITH_THINKING, resolvedMaxTokens)
+      : resolvedMaxTokens,
     messages: userMessages,
   };
 
