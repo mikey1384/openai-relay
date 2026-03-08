@@ -121,6 +121,42 @@ function sendDirectDubbingReplay(
   sendError(res, replay.status, replay.error, replay.details);
 }
 
+function watchClientDisconnect(
+  req: IncomingMessage,
+  res: ServerResponse,
+  onDisconnect: () => void
+): {
+  isDisconnected: () => boolean;
+  cleanup: () => void;
+} {
+  let disconnected = false;
+  const disconnect = () => {
+    if (disconnected) return;
+    disconnected = true;
+    onDisconnect();
+  };
+
+  const onAborted = () => disconnect();
+  const onResponseClose = () => {
+    if (!res.writableEnded) {
+      disconnect();
+    }
+  };
+
+  req.on("aborted", onAborted);
+  res.on("close", onResponseClose);
+
+  return {
+    // `req.destroyed` flips after a request body has been fully consumed, so
+    // it is not a reliable signal that the upstream client cancelled.
+    isDisconnected: () => disconnected || req.aborted,
+    cleanup: () => {
+      req.off("aborted", onAborted);
+      res.off("close", onResponseClose);
+    },
+  };
+}
+
 function asObject(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -304,15 +340,14 @@ async function handleDubDirect(
     | { requestKey: string; entry: DirectDubbingReplayEntry }
     | null = null;
   let stopLeaseHeartbeat: (() => void) | null = null;
+  const requestAbortController = new AbortController();
+  const disconnectWatcher = watchClientDisconnect(req, res, () => {
+    requestAbortController.abort();
+  });
   try {
-    let requestClosed = false;
-    const requestAbortController = new AbortController();
-    req.on("close", () => {
-      requestClosed = true;
-      requestAbortController.abort();
-    });
     const isRequestAborted = () =>
-      requestClosed || requestAbortController.signal.aborted;
+      disconnectWatcher.isDisconnected() ||
+      requestAbortController.signal.aborted;
     const buildAbortError = () => {
       const error = new Error("Request cancelled");
       error.name = "AbortError";
@@ -831,6 +866,7 @@ async function handleDubDirect(
 
     sendError(res, 500, "Dub synthesis failed", error.message);
   } finally {
+    disconnectWatcher.cleanup();
     stopLeaseHeartbeat?.();
   }
 }
@@ -885,10 +921,8 @@ async function handleDubElevenLabs(
     return;
   }
 
-  let requestClosed = false;
   const requestAbortController = new AbortController();
-  req.on("close", () => {
-    requestClosed = true;
+  const disconnectWatcher = watchClientDisconnect(req, res, () => {
     requestAbortController.abort();
   });
 
@@ -940,14 +974,20 @@ async function handleDubElevenLabs(
     // Process segments with concurrency limit
     const CONCURRENCY = 3;
     for (let i = 0; i < segmentsPayload.length; i += CONCURRENCY) {
-      if (requestClosed || requestAbortController.signal.aborted) {
+      if (
+        disconnectWatcher.isDisconnected() ||
+        requestAbortController.signal.aborted
+      ) {
         console.warn("⚠️ /dub-elevenlabs aborted by upstream client during synthesis");
         return;
       }
       const batch = segmentsPayload.slice(i, i + CONCURRENCY);
       const results = await Promise.all(
         batch.map(async (seg: any) => {
-          if (requestClosed || requestAbortController.signal.aborted) {
+          if (
+            disconnectWatcher.isDisconnected() ||
+            requestAbortController.signal.aborted
+          ) {
             throw new Error("Client disconnected");
           }
           const audioBuffer = await synthesizeWithElevenLabs({
@@ -988,6 +1028,8 @@ async function handleDubElevenLabs(
     }
     console.error("❌ ElevenLabs TTS error:", error.message);
     sendError(res, 500, "Dub synthesis failed", error.message);
+  } finally {
+    disconnectWatcher.cleanup();
   }
 }
 
@@ -1154,132 +1196,135 @@ async function handleDub(
         targetDuration?: number;
       }> = new Array(segmentsPayload.length);
 
-      let requestClosed = false;
       const segmentAbortControllers = new Map<number, AbortController>();
-
-      req.on("close", () => {
-        requestClosed = true;
+      const disconnectWatcher = watchClientDisconnect(req, res, () => {
         for (const controller of segmentAbortControllers.values()) {
           controller.abort();
         }
       });
+      try {
+        const synthesizeSegment = async (segIdx: number) => {
+          const seg = segmentsPayload[segIdx];
+          let attempt = 0;
+          const abortController = new AbortController();
+          segmentAbortControllers.set(segIdx, abortController);
 
-      const synthesizeSegment = async (segIdx: number) => {
-        const seg = segmentsPayload[segIdx];
-        let attempt = 0;
-        const abortController = new AbortController();
-        segmentAbortControllers.set(segIdx, abortController);
+          try {
+            while (true) {
+              if (disconnectWatcher.isDisconnected()) {
+                throw new Error("Client disconnected");
+              }
+
+              attempt += 1;
+              try {
+                const speech = await client.audio.speech.create(
+                  {
+                    model,
+                    voice,
+                    input: seg.text,
+                    response_format: format,
+                  },
+                  { signal: abortController.signal }
+                );
+                const arrayBuffer = await speech.arrayBuffer();
+                segmentResponses[segIdx] = {
+                  index: seg.index,
+                  audioBase64: Buffer.from(arrayBuffer).toString("base64"),
+                  targetDuration: seg.targetDuration,
+                };
+                return;
+              } catch (segmentError: any) {
+                if (
+                  disconnectWatcher.isDisconnected() ||
+                  abortController.signal.aborted
+                ) {
+                  throw segmentError;
+                }
+
+                if (attempt >= DUB_MAX_RETRIES || !shouldRetrySegmentError(segmentError)) {
+                  throw segmentError;
+                }
+
+                const delay = Math.min(
+                  DUB_RETRY_MAX_DELAY_MS,
+                  DUB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+                );
+                console.warn(
+                  `⚠️ Segment ${segIdx + 1}/${segmentsPayload.length} retry ${attempt}/${DUB_MAX_RETRIES} in ${delay}ms:`,
+                  segmentError?.message || segmentError
+                );
+                await sleep(delay);
+              }
+            }
+          } finally {
+            segmentAbortControllers.delete(segIdx);
+          }
+        };
+
+        // Use a queue to distribute work safely across workers
+        const pendingIndices = segmentsPayload.map((_: any, i: number) => i);
+        const workerCount = Math.min(DUB_MAX_CONCURRENCY, segmentsPayload.length);
+
+        const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
+          while (true) {
+            if (disconnectWatcher.isDisconnected()) {
+              return;
+            }
+
+            const current = pendingIndices.shift();
+            if (current === undefined) {
+              return;
+            }
+
+            const seg = segmentsPayload[current];
+            console.log(
+              `   • Worker ${workerIdx + 1}/${workerCount} segment ${
+                current + 1
+              }/${segmentsPayload.length} (index=${seg.index}, ${seg.text.length} chars)`
+            );
+            await synthesizeSegment(current);
+            console.log(`     · Completed segment ${current + 1}/${segmentsPayload.length}`);
+          }
+        });
 
         try {
-          while (true) {
-            if (requestClosed) {
-              throw new Error("Client disconnected");
-            }
-
-            attempt += 1;
-            try {
-              const speech = await client.audio.speech.create(
-                {
-                  model,
-                  voice,
-                  input: seg.text,
-                  response_format: format,
-                },
-                { signal: abortController.signal }
-              );
-              const arrayBuffer = await speech.arrayBuffer();
-              segmentResponses[segIdx] = {
-                index: seg.index,
-                audioBase64: Buffer.from(arrayBuffer).toString("base64"),
-                targetDuration: seg.targetDuration,
-              };
-              return;
-            } catch (segmentError: any) {
-              if (requestClosed || abortController.signal.aborted) {
-                throw segmentError;
-              }
-
-              if (attempt >= DUB_MAX_RETRIES || !shouldRetrySegmentError(segmentError)) {
-                throw segmentError;
-              }
-
-              const delay = Math.min(
-                DUB_RETRY_MAX_DELAY_MS,
-                DUB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
-              );
-              console.warn(
-                `⚠️ Segment ${segIdx + 1}/${segmentsPayload.length} retry ${attempt}/${DUB_MAX_RETRIES} in ${delay}ms:`,
-                segmentError?.message || segmentError
-              );
-              await sleep(delay);
-            }
-          }
-        } finally {
-          segmentAbortControllers.delete(segIdx);
-        }
-      };
-
-      // Use a queue to distribute work safely across workers
-      const pendingIndices = segmentsPayload.map((_: any, i: number) => i);
-      const workerCount = Math.min(DUB_MAX_CONCURRENCY, segmentsPayload.length);
-
-      const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
-        while (true) {
-          if (requestClosed) {
+          await Promise.all(workers);
+        } catch (segmentError: any) {
+          if (disconnectWatcher.isDisconnected()) {
+            console.warn("⚠️ Dub request aborted by upstream client while synthesizing segments");
             return;
           }
 
-          const current = pendingIndices.shift();
-          if (current === undefined) {
-            return;
-          }
-
-          const seg = segmentsPayload[current];
-          console.log(
-            `   • Worker ${workerIdx + 1}/${workerCount} segment ${
-              current + 1
-            }/${segmentsPayload.length} (index=${seg.index}, ${seg.text.length} chars)`
+          const details = segmentError?.response?.data ?? segmentError?.message;
+          console.error("❌ Relay segment synthesis failed:", details);
+          sendError(
+            res,
+            500,
+            "Dub synthesis failed",
+            typeof details === "string" ? details : JSON.stringify(details)
           );
-          await synthesizeSegment(current);
-          console.log(`     · Completed segment ${current + 1}/${segmentsPayload.length}`);
-        }
-      });
-
-      try {
-        await Promise.all(workers);
-      } catch (segmentError: any) {
-        if (requestClosed) {
-          console.warn("⚠️ Dub request aborted by upstream client while synthesizing segments");
           return;
         }
 
-        const details = segmentError?.response?.data ?? segmentError?.message;
-        console.error("❌ Relay segment synthesis failed:", details);
-        sendError(
-          res,
-          500,
-          "Dub synthesis failed",
-          typeof details === "string" ? details : JSON.stringify(details)
-        );
+        if (disconnectWatcher.isDisconnected()) {
+          console.warn("⚠️ Dub request closed before completion; skipping response");
+          return;
+        }
+
+        const completedSegments = segmentResponses.filter(Boolean);
+
+        sendJson(res, {
+          voice,
+          model,
+          format,
+          segmentCount: completedSegments.length,
+          totalCharacters,
+          segments: completedSegments,
+        });
         return;
+      } finally {
+        disconnectWatcher.cleanup();
       }
-
-      if (requestClosed) {
-        console.warn("⚠️ Dub request closed before completion; skipping response");
-        return;
-      }
-
-      const completedSegments = segmentResponses.filter(Boolean);
-
-      sendJson(res, {
-        voice,
-        model,
-        format,
-        segmentCount: completedSegments.length,
-        totalCharacters,
-        segments: completedSegments,
-      });
-      return;
     }
 
     if (!lines.length) {

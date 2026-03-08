@@ -148,6 +148,42 @@ function pruneDirectTranscriptionReplayCache(now = Date.now()): void {
   }
 }
 
+function watchClientDisconnect(
+  req: IncomingMessage,
+  res: ServerResponse,
+  onDisconnect: () => void
+): {
+  isDisconnected: () => boolean;
+  cleanup: () => void;
+} {
+  let disconnected = false;
+  const disconnect = () => {
+    if (disconnected) return;
+    disconnected = true;
+    onDisconnect();
+  };
+
+  const onAborted = () => disconnect();
+  const onResponseClose = () => {
+    if (!res.writableEnded) {
+      disconnect();
+    }
+  };
+
+  req.on("aborted", onAborted);
+  res.on("close", onResponseClose);
+
+  return {
+    // A fully consumed request body can still flip request internals, so only
+    // treat an explicit abort / premature response close as disconnect.
+    isDisconnected: () => disconnected || req.aborted,
+    cleanup: () => {
+      req.off("aborted", onAborted);
+      res.off("close", onResponseClose);
+    },
+  };
+}
+
 function settleDirectTranscriptionReplayEntry({
   requestKey,
   entry,
@@ -353,10 +389,8 @@ async function handleTranscribe(
   const idempotencyKey =
     getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
 
-  let requestClosed = false;
   const requestAbortController = new AbortController();
-  req.on("close", () => {
-    requestClosed = true;
+  const disconnectWatcher = watchClientDisconnect(req, res, () => {
     requestAbortController.abort();
   });
 
@@ -486,13 +520,16 @@ async function handleTranscribe(
         }
 
         console.log("🎯 Relay transcription completed with ElevenLabs.");
-        if (requestClosed) {
+        if (disconnectWatcher.isDisconnected()) {
           console.warn("⚠️ /transcribe client disconnected after ElevenLabs success");
           return;
         }
         sendJson(res, whisperFormat);
       } catch (scribeError: any) {
-        if (requestClosed || requestAbortController.signal.aborted) {
+        if (
+          disconnectWatcher.isDisconnected() ||
+          requestAbortController.signal.aborted
+        ) {
           console.warn("⚠️ /transcribe client disconnected during ElevenLabs transcription");
           return;
         }
@@ -529,7 +566,7 @@ async function handleTranscribe(
           prompt: prompt || undefined,
           signal: requestAbortController.signal,
         });
-        if (requestClosed) {
+        if (disconnectWatcher.isDisconnected()) {
           console.warn("⚠️ /transcribe client disconnected after Whisper fallback success");
           return;
         }
@@ -569,19 +606,24 @@ async function handleTranscribe(
       });
 
       console.log("🎯 Relay transcription completed with Whisper.");
-      if (requestClosed) {
+      if (disconnectWatcher.isDisconnected()) {
         console.warn("⚠️ /transcribe client disconnected after Whisper success");
         return;
       }
       sendJson(res, transcription);
     }
   } catch (error: any) {
-    if (requestClosed || requestAbortController.signal.aborted) {
+    if (
+      disconnectWatcher.isDisconnected() ||
+      requestAbortController.signal.aborted
+    ) {
       console.warn("⚠️ /transcribe aborted by upstream client");
       return;
     }
     console.error("❌ Relay transcription error:", error.message);
     sendError(res, 500, "Transcription failed", error.message);
+  } finally {
+    disconnectWatcher.cleanup();
   }
 }
 
@@ -635,10 +677,8 @@ async function handleTranscribeElevenLabs(
   const idempotencyKey =
     getHeader(req, "idempotency-key") || getHeader(req, "x-idempotency-key");
 
-  let requestClosed = false;
   const requestAbortController = new AbortController();
-  req.on("close", () => {
-    requestClosed = true;
+  const disconnectWatcher = watchClientDisconnect(req, res, () => {
     requestAbortController.abort();
   });
 
@@ -721,18 +761,23 @@ async function handleTranscribeElevenLabs(
     const whisperFormat = toWhisperCompatibleScribeResult(result);
 
     console.log(`🎯 ElevenLabs Scribe transcription completed!`);
-    if (requestClosed) {
+    if (disconnectWatcher.isDisconnected()) {
       console.warn("⚠️ /transcribe-elevenlabs client disconnected after success");
       return;
     }
     sendJson(res, whisperFormat);
   } catch (error: any) {
-    if (requestClosed || requestAbortController.signal.aborted) {
+    if (
+      disconnectWatcher.isDisconnected() ||
+      requestAbortController.signal.aborted
+    ) {
       console.warn("⚠️ /transcribe-elevenlabs aborted by upstream client");
       return;
     }
     console.error("❌ ElevenLabs Scribe error:", error.message);
     sendError(res, 500, "Transcription failed", error.message);
+  } finally {
+    disconnectWatcher.cleanup();
   }
 }
 
