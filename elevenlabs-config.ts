@@ -2,6 +2,26 @@ import { Buffer } from "node:buffer";
 import * as fs from "node:fs/promises";
 
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1";
+export const ELEVENLABS_TTS_MODEL_ID = "eleven_v3";
+export const ELEVENLABS_TTS_MAX_TEXT_CHARACTERS = 5_000;
+
+function usesElevenV3(modelId?: string): boolean {
+  return (
+    String(modelId || "")
+      .trim()
+      .toLowerCase() === ELEVENLABS_TTS_MODEL_ID
+  );
+}
+
+export function assertElevenLabsTtsTextLength(text: string): void {
+  if (text.length <= ELEVENLABS_TTS_MAX_TEXT_CHARACTERS) {
+    return;
+  }
+
+  throw new Error(
+    `ElevenLabs v3 accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment`,
+  );
+}
 
 export interface ScribeWord {
   text: string;
@@ -56,7 +76,7 @@ export async function transcribeWithScribe({
   formData.append(
     "file",
     new Blob([new Uint8Array(fileBuffer)], { type: "audio/webm" }),
-    fileName
+    fileName,
   );
   formData.append("model_id", "scribe_v2");
   if (languageCode && languageCode !== "auto") {
@@ -79,7 +99,7 @@ export async function transcribeWithScribe({
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `ElevenLabs Scribe API error: ${response.status} - ${errorText}`
+      `ElevenLabs Scribe API error: ${response.status} - ${errorText}`,
     );
   }
 
@@ -118,7 +138,7 @@ export async function transcribeWithScribe({
       const sentenceEnded =
         currentSegment.words.length > 0 &&
         SENTENCE_ENDERS.test(
-          currentSegment.words[currentSegment.words.length - 1]?.text || ""
+          currentSegment.words[currentSegment.words.length - 1]?.text || "",
         );
       const tooLong =
         currentSegment.words.length > 0 &&
@@ -195,7 +215,9 @@ function resolveElevenLabsDubFormat(format?: string): {
   apiOutputFormat: string;
   wrapPcmAsWav?: boolean;
 } {
-  const normalized = String(format || "mp3").trim().toLowerCase();
+  const normalized = String(format || "mp3")
+    .trim()
+    .toLowerCase();
   switch (normalized) {
     case "mp3":
       return {
@@ -220,7 +242,7 @@ function resolveElevenLabsDubFormat(format?: string): {
       };
     default:
       throw new Error(
-        `ElevenLabs does not support requested output format "${normalized}"`
+        `ElevenLabs does not support requested output format "${normalized}"`,
       );
   }
 }
@@ -229,7 +251,7 @@ function wrapPcm16LeAsWav(
   pcmBuffer: Buffer,
   sampleRate = 44_100,
   channels = 1,
-  bitsPerSample = 16
+  bitsPerSample = 16,
 ): Buffer {
   const blockAlign = (channels * bitsPerSample) / 8;
   const byteRate = sampleRate * blockAlign;
@@ -256,7 +278,7 @@ function wrapPcm16LeAsWav(
 export async function synthesizeWithElevenLabs({
   text,
   voice = "adam",
-  modelId = "eleven_multilingual_v2",
+  modelId = ELEVENLABS_TTS_MODEL_ID,
   format = "mp3",
   apiKey,
   signal,
@@ -268,6 +290,8 @@ export async function synthesizeWithElevenLabs({
   apiKey: string;
   signal?: AbortSignal;
 }): Promise<Buffer> {
+  assertElevenLabsTtsTextLength(text);
+
   // ElevenLabs voice IDs - map common names to IDs
   const voiceIdMap: Record<string, string> = {
     adam: "pNInz6obpgDQGcFmaJgB",
@@ -297,10 +321,21 @@ export async function synthesizeWithElevenLabs({
   const voiceId = voiceIdMap[voice.toLowerCase()] || voice;
 
   const outputSpec = resolveElevenLabsDubFormat(format);
+  const requestBody: Record<string, unknown> = {
+    text,
+    model_id: modelId,
+  };
+
+  if (!usesElevenV3(modelId)) {
+    requestBody.voice_settings = {
+      stability: 0.5,
+      similarity_boost: 0.75,
+    };
+  }
 
   const response = await fetch(
     `${ELEVENLABS_API_BASE}/text-to-speech/${voiceId}?output_format=${encodeURIComponent(
-      outputSpec.apiOutputFormat
+      outputSpec.apiOutputFormat,
     )}`,
     {
       method: "POST",
@@ -308,22 +343,15 @@ export async function synthesizeWithElevenLabs({
         "xi-api-key": apiKey,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        text,
-        model_id: modelId,
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
-        },
-      }),
+      body: JSON.stringify(requestBody),
       signal,
-    }
+    },
   );
 
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `ElevenLabs TTS API error: ${response.status} - ${errorText}`
+      `ElevenLabs TTS API error: ${response.status} - ${errorText}`,
     );
   }
 
@@ -464,7 +492,7 @@ export async function submitDubbingJob({
   formData.append(
     "file",
     new Blob([new Uint8Array(fileBuffer)], { type: mimeType }),
-    fileName
+    fileName,
   );
   formData.append("target_lang", normalizedTargetLang);
   formData.append("mode", "automatic");
@@ -488,7 +516,7 @@ export async function submitDubbingJob({
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `ElevenLabs Dubbing submit error: ${response.status} - ${errorText}`
+      `ElevenLabs Dubbing submit error: ${response.status} - ${errorText}`,
     );
   }
 
@@ -500,7 +528,7 @@ export async function submitDubbingJob({
  */
 export async function getDubbingStatus(
   dubbingId: string,
-  apiKey: string
+  apiKey: string,
 ): Promise<DubbingStatusResponse> {
   const response = await fetch(`${ELEVENLABS_API_BASE}/dubbing/${dubbingId}`, {
     headers: {
@@ -511,7 +539,7 @@ export async function getDubbingStatus(
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `ElevenLabs Dubbing status error: ${response.status} - ${errorText}`
+      `ElevenLabs Dubbing status error: ${response.status} - ${errorText}`,
     );
   }
 
@@ -524,7 +552,7 @@ export async function getDubbingStatus(
 export async function getDubbedAudio(
   dubbingId: string,
   languageCode: string,
-  apiKey: string
+  apiKey: string,
 ): Promise<Buffer> {
   const normalizedLang = normalizeLanguageCode(languageCode);
   const response = await fetch(
@@ -533,13 +561,13 @@ export async function getDubbedAudio(
       headers: {
         "xi-api-key": apiKey,
       },
-    }
+    },
   );
 
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `ElevenLabs Dubbing audio error: ${response.status} - ${errorText}`
+      `ElevenLabs Dubbing audio error: ${response.status} - ${errorText}`,
     );
   }
 
@@ -553,7 +581,7 @@ export async function getDubbedAudio(
 export async function getDubbedTranscript(
   dubbingId: string,
   languageCode: string,
-  apiKey: string
+  apiKey: string,
 ): Promise<string> {
   const normalizedLang = normalizeLanguageCode(languageCode);
   const response = await fetch(
@@ -562,13 +590,13 @@ export async function getDubbedTranscript(
       headers: {
         "xi-api-key": apiKey,
       },
-    }
+    },
   );
 
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(
-      `ElevenLabs Dubbing transcript error: ${response.status} - ${errorText}`
+      `ElevenLabs Dubbing transcript error: ${response.status} - ${errorText}`,
     );
   }
 
@@ -630,7 +658,7 @@ export async function dubWithElevenLabs({
   });
 
   console.log(
-    `🎬 Dubbing job submitted: ${dubbing_id} (expected: ${expected_duration_sec}s)`
+    `🎬 Dubbing job submitted: ${dubbing_id} (expected: ${expected_duration_sec}s)`,
   );
 
   // Poll for completion
@@ -665,7 +693,7 @@ export async function dubWithElevenLabs({
   const transcript = await getDubbedTranscript(
     dubbing_id,
     targetLanguage,
-    apiKey
+    apiKey,
   );
 
   return {

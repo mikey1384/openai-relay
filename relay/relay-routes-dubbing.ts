@@ -1,6 +1,10 @@
 import { Buffer } from "node:buffer";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { IncomingForm } from "formidable";
+import {
+  ELEVENLABS_TTS_MAX_TEXT_CHARACTERS,
+  ELEVENLABS_TTS_MODEL_ID,
+} from "../elevenlabs-config.js";
 import type { RelayRoutesContext } from "./relay-routes.js";
 import {
   createDirectRequestLease,
@@ -49,8 +53,8 @@ const DIRECT_DUBBING_REPLAY_TTL_MS = Math.max(
   1_000,
   Number.parseInt(
     process.env.DIRECT_DUBBING_REPLAY_TTL_MS || String(10 * 60 * 1_000),
-    10
-  )
+    10,
+  ),
 );
 const directDubbingReplayCache = new Map<string, DirectDubbingReplayEntry>();
 
@@ -111,7 +115,7 @@ function sendDirectDubbingReplay(
   res: ServerResponse,
   replay: DirectDubbingReplayResult,
   sendError: RelayRoutesContext["sendError"],
-  sendJson: RelayRoutesContext["sendJson"]
+  sendJson: RelayRoutesContext["sendJson"],
 ): void {
   if (replay.kind === "success") {
     sendJson(res, replay.data, replay.status);
@@ -124,7 +128,7 @@ function sendDirectDubbingReplay(
 function watchClientDisconnect(
   req: IncomingMessage,
   res: ServerResponse,
-  onDisconnect: () => void
+  onDisconnect: () => void,
 ): {
   isDisconnected: () => boolean;
   cleanup: () => void;
@@ -164,8 +168,40 @@ function asObject(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
+function getRelaySegmentText(segment: any): string {
+  if (typeof segment?.text === "string") {
+    return segment.text.trim();
+  }
+  if (typeof segment?.translation === "string") {
+    return segment.translation.trim();
+  }
+  return "";
+}
+
+function findOversizedElevenLabsSegment(
+  segments: any[],
+): { index: number; length: number } | null {
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    const text = getRelaySegmentText(segment);
+    if (text.length <= ELEVENLABS_TTS_MAX_TEXT_CHARACTERS) {
+      continue;
+    }
+
+    return {
+      index:
+        Number.isFinite(segment?.index) && Number(segment.index) >= 0
+          ? Number(segment.index)
+          : index + 1,
+      length: text.length,
+    };
+  }
+
+  return null;
+}
+
 function extractStoredDirectDubbingReplay(
-  reservationMeta: unknown
+  reservationMeta: unknown,
 ): StoredDirectReplayResult | null {
   return extractStoredDirectReplayResult(reservationMeta, "Dubbing failed");
 }
@@ -182,7 +218,7 @@ function buildStoredDirectDubbingReplayMeta(
 }
 
 function extractPendingDirectDubbingFinalize(
-  reservationMeta: unknown
+  reservationMeta: unknown,
 ): PendingDirectDubbingFinalize | null {
   const metaObject = asObject(reservationMeta);
   const pendingObject = asObject(metaObject?.pendingFinalize);
@@ -266,7 +302,7 @@ async function recoverReservedDirectDubbingReplay({
 export async function handleDubbingRoutes(
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: RelayRoutesContext
+  ctx: RelayRoutesContext,
 ): Promise<boolean> {
   if (req.method === "POST" && req.url === "/dub-direct") {
     await handleDubDirect(req, res, ctx);
@@ -289,7 +325,7 @@ export async function handleDubbingRoutes(
 async function handleDubDirect(
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: RelayRoutesContext
+  ctx: RelayRoutesContext,
 ): Promise<void> {
   console.log("📡 Processing direct dub request...");
 
@@ -329,16 +365,23 @@ async function handleDubDirect(
   });
   if (!authResult.ok) {
     console.log(`❌ Authorization failed: ${authResult.status}`);
-    sendError(res, authResult.status, authResult.error || "Authorization failed");
+    sendError(
+      res,
+      authResult.status,
+      authResult.error || "Authorization failed",
+    );
     return;
   }
   const deviceId = authResult.deviceId;
-  console.log(`✅ Authorized device ${deviceId}, balance: ${authResult.creditBalance}`);
+  console.log(
+    `✅ Authorized device ${deviceId}, balance: ${authResult.creditBalance}`,
+  );
 
   // Step 2: Parse request and synthesize speech
-  let replayContext:
-    | { requestKey: string; entry: DirectDubbingReplayEntry }
-    | null = null;
+  let replayContext: {
+    requestKey: string;
+    entry: DirectDubbingReplayEntry;
+  } | null = null;
   let stopLeaseHeartbeat: (() => void) | null = null;
   const requestAbortController = new AbortController();
   const disconnectWatcher = watchClientDisconnect(req, res, () => {
@@ -371,10 +414,24 @@ async function handleDubDirect(
       return;
     }
 
+    if (ttsProvider === "elevenlabs") {
+      const oversizedSegment = findOversizedElevenLabsSegment(segments);
+      if (oversizedSegment) {
+        sendError(
+          res,
+          413,
+          "Segment too long",
+          `Segment ${oversizedSegment.index} has ${oversizedSegment.length} characters. ElevenLabs v3 accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment.`,
+        );
+        return;
+      }
+    }
+
     // Calculate total characters for billing
     const totalCharacters = segments.reduce(
-      (sum: number, seg: any) => sum + (seg.text?.length || seg.translation?.length || 0),
-      0
+      (sum: number, seg: any) =>
+        sum + (seg.text?.length || seg.translation?.length || 0),
+      0,
     );
     const requestKey = buildRelayRequestKey({
       service: STAGE5_RELAY_BILLING_SERVICES.TTS,
@@ -391,7 +448,7 @@ async function handleDubDirect(
     pruneDirectDubbingReplayCache();
     const existingReplay = directDubbingReplayCache.get(requestKey);
     if (existingReplay) {
-      const replay = existingReplay.result ?? await existingReplay.promise;
+      const replay = existingReplay.result ?? (await existingReplay.promise);
       sendDirectDubbingReplay(res, replay, sendError, sendJson);
       return;
     }
@@ -416,7 +473,7 @@ async function handleDubDirect(
     const sendReplayError = (
       status: number,
       error: string,
-      details?: string
+      details?: string,
     ): void => {
       const replay: DirectDubbingReplayResult = {
         kind: "error",
@@ -432,8 +489,13 @@ async function handleDubDirect(
       sendDirectDubbingReplay(res, replay, sendError, sendJson);
     };
     const directRequestLease = createDirectRequestLease();
-    let reserveResult: Awaited<ReturnType<typeof reserveRelayCredits>> | null = null;
-    for (let orphanRecoveryAttempt = 0; orphanRecoveryAttempt < 2; orphanRecoveryAttempt += 1) {
+    let reserveResult: Awaited<ReturnType<typeof reserveRelayCredits>> | null =
+      null;
+    for (
+      let orphanRecoveryAttempt = 0;
+      orphanRecoveryAttempt < 2;
+      orphanRecoveryAttempt += 1
+    ) {
       reserveResult = await reserveRelayCredits({
         cfApiBase: CF_API_BASE,
         relaySecret: RELAY_SECRET,
@@ -442,7 +504,7 @@ async function handleDubDirect(
           requestKey,
           service: STAGE5_RELAY_BILLING_SERVICES.TTS,
           characters: totalCharacters,
-          model: ttsProvider === "elevenlabs" ? "eleven_multilingual_v2" : model,
+          model: ttsProvider === "elevenlabs" ? ELEVENLABS_TTS_MODEL_ID : model,
           meta: {
             directRequestLease,
           },
@@ -474,20 +536,11 @@ async function handleDubDirect(
             result: recovered.replay,
             cacheSuccess: recovered.replay.kind === "success",
           });
-          sendDirectDubbingReplay(
-            res,
-            recovered.replay,
-            sendError,
-            sendJson
-          );
+          sendDirectDubbingReplay(res, recovered.replay, sendError, sendJson);
           return;
         }
         if (recovered?.kind === "error") {
-          sendReplayError(
-            recovered.status,
-            recovered.error,
-            recovered.details
-          );
+          sendReplayError(recovered.status, recovered.error, recovered.details);
           return;
         }
 
@@ -504,7 +557,7 @@ async function handleDubDirect(
           sendReplayError(
             orphanRecovery.status,
             orphanRecovery.error,
-            orphanRecovery.details
+            orphanRecovery.details,
           );
           return;
         }
@@ -513,7 +566,7 @@ async function handleDubDirect(
             cfApiBase: CF_API_BASE,
             relaySecret: RELAY_SECRET,
             storedReplay: extractStoredDirectDubbingReplay(
-              orphanRecovery.reservationMeta
+              orphanRecovery.reservationMeta,
             ),
           });
           if (settledReplay?.kind === "success") {
@@ -530,7 +583,7 @@ async function handleDubDirect(
             sendReplayError(
               settledReplay.status,
               settledReplay.error,
-              settledReplay.details
+              settledReplay.details,
             );
             return;
           }
@@ -546,7 +599,7 @@ async function handleDubDirect(
         cfApiBase: CF_API_BASE,
         relaySecret: RELAY_SECRET,
         storedReplay: extractStoredDirectDubbingReplay(
-          reserveResult.reservationMeta
+          reserveResult.reservationMeta,
         ),
       });
       if (persistedReplay?.kind === "success") {
@@ -563,7 +616,7 @@ async function handleDubDirect(
         sendReplayError(
           persistedReplay.status,
           persistedReplay.error,
-          persistedReplay.details
+          persistedReplay.details,
         );
         return;
       }
@@ -571,7 +624,11 @@ async function handleDubDirect(
       sendReplayError(409, "Duplicate request");
       return;
     }
-    if (!reserveResult || !reserveResult.ok || reserveResult.status === "duplicate") {
+    if (
+      !reserveResult ||
+      !reserveResult.ok ||
+      reserveResult.status === "duplicate"
+    ) {
       sendReplayError(500, "Credit reservation failed");
       return;
     }
@@ -585,7 +642,7 @@ async function handleDubDirect(
     });
 
     console.log(
-      `🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ${ttsProvider}...`
+      `🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ${ttsProvider}...`,
     );
 
     let result: any;
@@ -609,7 +666,7 @@ async function handleDubDirect(
           return;
         }
 
-        ttsModel = "eleven_multilingual_v2";
+        ttsModel = ELEVENLABS_TTS_MODEL_ID;
         const segmentResults: Array<{
           index: number;
           audioBase64: string;
@@ -624,7 +681,7 @@ async function handleDubDirect(
           const audioBuffer = await synthesizeWithElevenLabs({
             text,
             voice,
-            modelId: "eleven_multilingual_v2",
+            modelId: ELEVENLABS_TTS_MODEL_ID,
             format,
             apiKey: elevenLabsKey,
             signal: requestAbortController.signal,
@@ -669,44 +726,46 @@ async function handleDubDirect(
           targetDuration?: number;
         }> = [];
 
-      console.log(`   DEBUG: About to process ${segments.length} segments for OpenAI TTS`);
-      console.log(`   DEBUG: First segment:`, JSON.stringify(segments[0]));
-
-      for (const seg of segments) {
-        throwIfRequestAborted();
-        const text = seg.text || seg.translation || "";
-        if (!text.trim()) continue;
-
         console.log(
-          `   • OpenAI TTS: voice=${voice}, model=${model}, format=${format}, text="${text.slice(0, 30)}..."`
+          `   DEBUG: About to process ${segments.length} segments for OpenAI TTS`,
         );
+        console.log(`   DEBUG: First segment:`, JSON.stringify(segments[0]));
 
-        try {
-          const ttsRes = await client.audio.speech.create(
-            {
-              model,
-              voice: voice as any,
-              input: text,
-              response_format: format as any,
-            },
-            { signal: requestAbortController.signal }
+        for (const seg of segments) {
+          throwIfRequestAborted();
+          const text = seg.text || seg.translation || "";
+          if (!text.trim()) continue;
+
+          console.log(
+            `   • OpenAI TTS: voice=${voice}, model=${model}, format=${format}, text="${text.slice(0, 30)}..."`,
           );
 
-          const audioBuffer = await ttsRes.arrayBuffer();
-          segmentResults.push({
-            index: seg.index ?? segmentResults.length,
-            audioBase64: Buffer.from(audioBuffer).toString("base64"),
-            targetDuration: seg.targetDuration,
-          });
-          console.log(`   ✓ OpenAI TTS segment complete`);
-        } catch (ttsErr: any) {
-          console.error(
-            `❌ OpenAI TTS error: ${ttsErr?.message || ttsErr}`,
-            ttsErr?.response?.data || ""
-          );
-          throw ttsErr;
+          try {
+            const ttsRes = await client.audio.speech.create(
+              {
+                model,
+                voice: voice as any,
+                input: text,
+                response_format: format as any,
+              },
+              { signal: requestAbortController.signal },
+            );
+
+            const audioBuffer = await ttsRes.arrayBuffer();
+            segmentResults.push({
+              index: seg.index ?? segmentResults.length,
+              audioBase64: Buffer.from(audioBuffer).toString("base64"),
+              targetDuration: seg.targetDuration,
+            });
+            console.log(`   ✓ OpenAI TTS segment complete`);
+          } catch (ttsErr: any) {
+            console.error(
+              `❌ OpenAI TTS error: ${ttsErr?.message || ttsErr}`,
+              ttsErr?.response?.data || "",
+            );
+            throw ttsErr;
+          }
         }
-      }
 
         result = {
           segments: segmentResults,
@@ -743,7 +802,10 @@ async function handleDubDirect(
           deviceId,
           requestKey,
           service: STAGE5_RELAY_BILLING_SERVICES.TTS,
-          meta: { reason: "vendor-error", message: ttsError?.message || String(ttsError) },
+          meta: {
+            reason: "vendor-error",
+            message: ttsError?.message || String(ttsError),
+          },
         },
       });
       throw ttsError;
@@ -793,7 +855,7 @@ async function handleDubDirect(
       sendReplayError(
         persistResult.status,
         persistResult.error || "Replay persistence failed",
-        persistResult.details
+        persistResult.details,
       );
       return;
     }
@@ -821,7 +883,7 @@ async function handleDubDirect(
           model: ttsModel,
           meta: {
             ...buildStoredDirectDubbingReplayMeta(
-              storedReplayResult.storedReplay
+              storedReplayResult.storedReplay,
             ),
             pendingFinalize: null,
           },
@@ -832,7 +894,7 @@ async function handleDubDirect(
         console.error(`❌ Credit finalize failed: ${finalizeResult.status}`);
         sendReplayError(
           normalizeRelayRecoveryFailureStatus(finalizeResult.status),
-          finalizeResult.error || "Credit finalize failed"
+          finalizeResult.error || "Credit finalize failed",
         );
         return;
       }
@@ -874,7 +936,7 @@ async function handleDubDirect(
 async function handleDubElevenLabs(
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: RelayRoutesContext
+  ctx: RelayRoutesContext,
 ): Promise<void> {
   console.log("🎬 Processing ElevenLabs TTS dub request...");
 
@@ -910,7 +972,11 @@ async function handleDubElevenLabs(
     },
   });
   if (!confirmResult.ok) {
-    sendError(res, confirmResult.status, confirmResult.error || "Reservation confirmation failed");
+    sendError(
+      res,
+      confirmResult.status,
+      confirmResult.error || "Reservation confirmation failed",
+    );
     return;
   }
 
@@ -931,7 +997,8 @@ async function handleDubElevenLabs(
     const segmentsPayload = Array.isArray(parsed?.segments)
       ? parsed.segments
           .map((segment: any, idx: number) => {
-            const text = typeof segment?.text === "string" ? segment.text.trim() : "";
+            const text =
+              typeof segment?.text === "string" ? segment.text.trim() : "";
             if (!text) return null;
             const index = Number.isFinite(segment?.index)
               ? Number(segment.index)
@@ -951,6 +1018,17 @@ async function handleDubElevenLabs(
       return;
     }
 
+    const oversizedSegment = findOversizedElevenLabsSegment(segmentsPayload);
+    if (oversizedSegment) {
+      sendError(
+        res,
+        413,
+        "Segment too long",
+        `Segment ${oversizedSegment.index} has ${oversizedSegment.length} characters. ElevenLabs v3 accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment.`,
+      );
+      return;
+    }
+
     const voice = parsed?.voice || "adam";
     const format =
       typeof parsed?.format === "string" && parsed.format.trim()
@@ -958,11 +1036,11 @@ async function handleDubElevenLabs(
         : "mp3";
     const totalCharacters = segmentsPayload.reduce(
       (sum: number, seg: any) => sum + seg.text.length,
-      0
+      0,
     );
 
     console.log(
-      `🎧 Synthesizing ${segmentsPayload.length} segments (${totalCharacters} chars) with ElevenLabs voice=${voice} format=${format}`
+      `🎧 Synthesizing ${segmentsPayload.length} segments (${totalCharacters} chars) with ElevenLabs voice=${voice} format=${format}`,
     );
 
     const segmentResponses: Array<{
@@ -978,7 +1056,9 @@ async function handleDubElevenLabs(
         disconnectWatcher.isDisconnected() ||
         requestAbortController.signal.aborted
       ) {
-        console.warn("⚠️ /dub-elevenlabs aborted by upstream client during synthesis");
+        console.warn(
+          "⚠️ /dub-elevenlabs aborted by upstream client during synthesis",
+        );
         return;
       }
       const batch = segmentsPayload.slice(i, i + CONCURRENCY);
@@ -1002,17 +1082,17 @@ async function handleDubElevenLabs(
             audioBase64: audioBuffer.toString("base64"),
             targetDuration: seg.targetDuration,
           };
-        })
+        }),
       );
       segmentResponses.push(...results);
       console.log(
-        `   • Completed ${Math.min(i + CONCURRENCY, segmentsPayload.length)}/${segmentsPayload.length} segments`
+        `   • Completed ${Math.min(i + CONCURRENCY, segmentsPayload.length)}/${segmentsPayload.length} segments`,
       );
     }
 
     sendJson(res, {
       voice,
-      model: "eleven_multilingual_v2",
+      model: ELEVENLABS_TTS_MODEL_ID,
       format,
       segmentCount: segmentResponses.length,
       totalCharacters,
@@ -1036,7 +1116,7 @@ async function handleDubElevenLabs(
 async function handleDub(
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: RelayRoutesContext
+  ctx: RelayRoutesContext,
 ): Promise<void> {
   console.log("🎬 Processing dub synthesis request...");
 
@@ -1082,7 +1162,11 @@ async function handleDub(
     },
   });
   if (!confirmResult.ok) {
-    sendError(res, confirmResult.status, confirmResult.error || "Reservation confirmation failed");
+    sendError(
+      res,
+      confirmResult.status,
+      confirmResult.error || "Reservation confirmation failed",
+    );
     return;
   }
 
@@ -1098,7 +1182,8 @@ async function handleDub(
     const segmentsPayload = Array.isArray(parsed?.segments)
       ? parsed.segments
           .map((segment: any, idx: number) => {
-            const rawText = typeof segment?.text === "string" ? segment.text : "";
+            const rawText =
+              typeof segment?.text === "string" ? segment.text : "";
             const text = rawText.trim();
             if (!text) {
               return null;
@@ -1107,7 +1192,8 @@ async function handleDub(
               ? Number(segment.index)
               : idx + 1;
             const start =
-              typeof segment?.start === "number" && Number.isFinite(segment.start)
+              typeof segment?.start === "number" &&
+              Number.isFinite(segment.start)
                 ? segment.start
                 : undefined;
             const end =
@@ -1131,14 +1217,14 @@ async function handleDub(
           })
           .filter(
             (
-              seg: any
+              seg: any,
             ): seg is {
               index: number;
               text: string;
               start?: number;
               end?: number;
               targetDuration?: number;
-            } => Boolean(seg)
+            } => Boolean(seg),
           )
       : [];
 
@@ -1166,14 +1252,14 @@ async function handleDub(
           res,
           413,
           "Dub request too large",
-          `Received ${segmentsPayload.length} segments, limit is ${DUB_MAX_SEGMENTS}`
+          `Received ${segmentsPayload.length} segments, limit is ${DUB_MAX_SEGMENTS}`,
         );
         return;
       }
 
       const totalCharacters = segmentsPayload.reduce(
         (sum: number, seg: { text: string }) => sum + seg.text.length,
-        0
+        0,
       );
 
       if (totalCharacters > DUB_MAX_TOTAL_CHARACTERS) {
@@ -1181,13 +1267,13 @@ async function handleDub(
           res,
           413,
           "Dub request too large",
-          `Received ${totalCharacters} characters, limit is ${DUB_MAX_TOTAL_CHARACTERS}`
+          `Received ${totalCharacters} characters, limit is ${DUB_MAX_TOTAL_CHARACTERS}`,
         );
         return;
       }
 
       console.log(
-        `🎧 Synthesizing ${segmentsPayload.length} segment(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`
+        `🎧 Synthesizing ${segmentsPayload.length} segment(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`,
       );
 
       const segmentResponses: Array<{
@@ -1224,7 +1310,7 @@ async function handleDub(
                     input: seg.text,
                     response_format: format,
                   },
-                  { signal: abortController.signal }
+                  { signal: abortController.signal },
                 );
                 const arrayBuffer = await speech.arrayBuffer();
                 segmentResponses[segIdx] = {
@@ -1241,17 +1327,20 @@ async function handleDub(
                   throw segmentError;
                 }
 
-                if (attempt >= DUB_MAX_RETRIES || !shouldRetrySegmentError(segmentError)) {
+                if (
+                  attempt >= DUB_MAX_RETRIES ||
+                  !shouldRetrySegmentError(segmentError)
+                ) {
                   throw segmentError;
                 }
 
                 const delay = Math.min(
                   DUB_RETRY_MAX_DELAY_MS,
-                  DUB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1)
+                  DUB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1),
                 );
                 console.warn(
                   `⚠️ Segment ${segIdx + 1}/${segmentsPayload.length} retry ${attempt}/${DUB_MAX_RETRIES} in ${delay}ms:`,
-                  segmentError?.message || segmentError
+                  segmentError?.message || segmentError,
                 );
                 await sleep(delay);
               }
@@ -1263,35 +1352,45 @@ async function handleDub(
 
         // Use a queue to distribute work safely across workers
         const pendingIndices = segmentsPayload.map((_: any, i: number) => i);
-        const workerCount = Math.min(DUB_MAX_CONCURRENCY, segmentsPayload.length);
+        const workerCount = Math.min(
+          DUB_MAX_CONCURRENCY,
+          segmentsPayload.length,
+        );
 
-        const workers = Array.from({ length: workerCount }, async (_, workerIdx) => {
-          while (true) {
-            if (disconnectWatcher.isDisconnected()) {
-              return;
+        const workers = Array.from(
+          { length: workerCount },
+          async (_, workerIdx) => {
+            while (true) {
+              if (disconnectWatcher.isDisconnected()) {
+                return;
+              }
+
+              const current = pendingIndices.shift();
+              if (current === undefined) {
+                return;
+              }
+
+              const seg = segmentsPayload[current];
+              console.log(
+                `   • Worker ${workerIdx + 1}/${workerCount} segment ${
+                  current + 1
+                }/${segmentsPayload.length} (index=${seg.index}, ${seg.text.length} chars)`,
+              );
+              await synthesizeSegment(current);
+              console.log(
+                `     · Completed segment ${current + 1}/${segmentsPayload.length}`,
+              );
             }
-
-            const current = pendingIndices.shift();
-            if (current === undefined) {
-              return;
-            }
-
-            const seg = segmentsPayload[current];
-            console.log(
-              `   • Worker ${workerIdx + 1}/${workerCount} segment ${
-                current + 1
-              }/${segmentsPayload.length} (index=${seg.index}, ${seg.text.length} chars)`
-            );
-            await synthesizeSegment(current);
-            console.log(`     · Completed segment ${current + 1}/${segmentsPayload.length}`);
-          }
-        });
+          },
+        );
 
         try {
           await Promise.all(workers);
         } catch (segmentError: any) {
           if (disconnectWatcher.isDisconnected()) {
-            console.warn("⚠️ Dub request aborted by upstream client while synthesizing segments");
+            console.warn(
+              "⚠️ Dub request aborted by upstream client while synthesizing segments",
+            );
             return;
           }
 
@@ -1301,13 +1400,15 @@ async function handleDub(
             res,
             500,
             "Dub synthesis failed",
-            typeof details === "string" ? details : JSON.stringify(details)
+            typeof details === "string" ? details : JSON.stringify(details),
           );
           return;
         }
 
         if (disconnectWatcher.isDisconnected()) {
-          console.warn("⚠️ Dub request closed before completion; skipping response");
+          console.warn(
+            "⚠️ Dub request closed before completion; skipping response",
+          );
           return;
         }
 
@@ -1332,7 +1433,10 @@ async function handleDub(
       return;
     }
 
-    const totalCharacters = lines.reduce((sum: number, line: string) => sum + line.length, 0);
+    const totalCharacters = lines.reduce(
+      (sum: number, line: string) => sum + line.length,
+      0,
+    );
     const chunks = chunkLines(lines, MAX_TTS_CHARS_PER_CHUNK);
 
     if (!chunks.length) {
@@ -1341,14 +1445,16 @@ async function handleDub(
     }
 
     console.log(
-      `🎧 Synthesizing ${chunks.length} chunk(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`
+      `🎧 Synthesizing ${chunks.length} chunk(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`,
     );
 
     const chunkBuffers: Buffer[] = [];
 
     for (let idx = 0; idx < chunks.length; idx++) {
       const chunk = chunks[idx];
-      console.log(`   • Chunk ${idx + 1}/${chunks.length} (${chunk.length} chars)`);
+      console.log(
+        `   • Chunk ${idx + 1}/${chunks.length} (${chunk.length} chars)`,
+      );
       const speech = await client.audio.speech.create({
         model,
         voice,
@@ -1372,6 +1478,11 @@ async function handleDub(
     });
   } catch (error: any) {
     console.error("❌ Relay dub synthesis error:", error?.message || error);
-    sendError(res, 500, "Dub synthesis failed", error?.message || String(error));
+    sendError(
+      res,
+      500,
+      "Dub synthesis failed",
+      error?.message || String(error),
+    );
   }
 }
