@@ -263,6 +263,11 @@ export async function handleTranslationRoutes(
   res: ServerResponse,
   ctx: RelayRoutesContext,
 ): Promise<boolean> {
+  if (req.method === "GET" && req.url === "/translation-capabilities") {
+    await handleTranslationCapabilities(req, res, ctx);
+    return true;
+  }
+
   if (req.method === "POST" && req.url === "/translate-direct") {
     await handleTranslateDirect(req, res, ctx);
     return true;
@@ -283,6 +288,33 @@ export async function handleTranslationRoutes(
   }
 
   return false;
+}
+
+async function handleTranslationCapabilities(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RelayRoutesContext,
+): Promise<void> {
+  const { RELAY_SECRET, getHeader, sendError, sendJson, validateRelaySecret } = ctx;
+
+  if (!validateRelaySecret(req, RELAY_SECRET)) {
+    sendError(res, 401, "Unauthorized - invalid relay secret");
+    return;
+  }
+
+  const workerAnthropicAvailableHeader =
+    getHeader(req, "x-stage5-worker-anthropic-available") || "";
+  const workerAnthropicAvailable =
+    workerAnthropicAvailableHeader === "1" ||
+    workerAnthropicAvailableHeader.toLowerCase() === "true";
+
+  sendJson(res, {
+    capabilities: {
+      stage5AnthropicReviewAvailable: Boolean(
+        process.env.ANTHROPIC_API_KEY || workerAnthropicAvailable,
+      ),
+    },
+  });
 }
 
 async function handleTranslateDirect(
@@ -897,6 +929,8 @@ async function handleTranslate(
             ? parsed.model.trim()
             : DEFAULT_TRANSLATION_MODEL,
         messages,
+        // Queued Stage5 translations can use either the worker-forwarded key
+        // or the relay's local Anthropic key.
         canUseAnthropic: Boolean(anthropicKey || process.env.ANTHROPIC_API_KEY),
         modelFamily,
         translationPhase,

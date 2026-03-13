@@ -1,4 +1,5 @@
 import {
+  CLAUDE_OPUS_MODEL,
   DEFAULT_TRANSLATION_MODEL,
   isClaudeModel,
   normalizeModelId,
@@ -103,8 +104,6 @@ export function resolveTranslationModel({
   qualityMode?: boolean;
 }): string {
   const normalized = normalizeModelId(rawModel || DEFAULT_TRANSLATION_MODEL);
-  void modelFamily;
-  void canUseAnthropic;
   const reviewByHeuristic = isLikelySubtitleReviewMessages(messages);
   const draftByHeuristic = isLikelySubtitleDraftMessages(messages);
   const isSubtitleWorkflow =
@@ -128,9 +127,15 @@ export function resolveTranslationModel({
             ? "review"
             : "draft";
 
+  const prefersClaudeReview =
+    canUseAnthropic &&
+    (modelFamily === "claude" || isClaudeModel(normalized));
+
   const selectedModel =
     effectivePhase === "review"
-      ? STAGE5_REVIEW_MODEL
+      ? prefersClaudeReview
+        ? CLAUDE_OPUS_MODEL
+        : STAGE5_REVIEW_MODEL
       : DEFAULT_TRANSLATION_MODEL;
 
   if (selectedModel !== normalized) {

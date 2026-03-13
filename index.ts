@@ -843,18 +843,20 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
 
   try {
     const payload = job.payload;
-    const model =
-      payload.mode === "chat"
-        ? resolveTranslationModel({
-            rawModel: payload.model,
-            modelFamily: payload.modelFamily,
-            messages: payload.messages,
-            canUseAnthropic: Boolean(
-              job.anthropicKey || process.env.ANTHROPIC_API_KEY,
-            ),
-            translationPhase: payload.translationPhase,
-            qualityMode: payload.qualityMode,
-          })
+      const model =
+        payload.mode === "chat"
+          ? resolveTranslationModel({
+              rawModel: payload.model,
+              modelFamily: payload.modelFamily,
+              messages: payload.messages,
+              // Queued Stage5 translations can use either the worker-forwarded
+              // key or the relay's local Anthropic key.
+              canUseAnthropic: Boolean(
+                job.anthropicKey || process.env.ANTHROPIC_API_KEY,
+              ),
+              translationPhase: payload.translationPhase,
+              qualityMode: payload.qualityMode,
+            })
         : normalizeModelId(payload.model || DEFAULT_TRANSLATION_MODEL);
     const maxCompletionTokens = resolveTranslationReservationMaxCompletionTokens({
       model,
