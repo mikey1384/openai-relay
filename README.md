@@ -63,6 +63,19 @@ flyctl launch --name translator-relay --region sin
 
 ```bash
 flyctl secrets set OPENAI_API_KEY=sk-your-openai-key-here
+flyctl secrets set ELEVENLABS_WEBHOOK_SECRET=your-elevenlabs-webhook-signing-secret
+```
+
+For async long-running ElevenLabs transcription, configure an ElevenLabs Speech-to-Text webhook to point at:
+
+```text
+https://translator-relay.fly.dev/webhook/elevenlabs/speech-to-text
+```
+
+If you use a dedicated webhook in ElevenLabs, set its id too:
+
+```bash
+flyctl secrets set ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_ID=your-webhook-id
 ```
 
 ### Deploy

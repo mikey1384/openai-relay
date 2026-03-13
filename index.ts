@@ -10,6 +10,8 @@ import {
   normalizeModelId,
 } from "./constants.js";
 import {
+  normalizeScribeResult,
+  startAsyncTranscriptionWithScribe,
   transcribeWithScribe,
   synthesizeWithElevenLabs,
   dubWithElevenLabs,
@@ -70,6 +72,13 @@ const DUB_MAX_SEGMENTS = Math.max(
   Number.parseInt(process.env.DUB_MAX_SEGMENTS || "240", 10),
 );
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB limit for request bodies
+const ELEVENLABS_WEBHOOK_MAX_BODY_SIZE = Math.max(
+  MAX_BODY_SIZE,
+  Number.parseInt(
+    process.env.ELEVENLABS_WEBHOOK_MAX_BODY_SIZE || String(64 * 1024 * 1024),
+    10,
+  ) || 64 * 1024 * 1024,
+);
 const MAX_TRANSLATION_JOBS = 1000; // Memory leak prevention
 const JOB_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes (reduced from 1 hour)
 const R2_FETCH_TIMEOUT_MS = 120_000; // 2 minute timeout for R2 fetches
@@ -109,6 +118,17 @@ if (!RELAY_SECRET_ENV) {
   process.exit(1);
 }
 const RELAY_SECRET: string = RELAY_SECRET_ENV;
+const ELEVENLABS_WEBHOOK_SECRET = String(
+  process.env.ELEVENLABS_WEBHOOK_SECRET || "",
+).trim();
+const ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_ID = String(
+  process.env.ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_ID || "",
+).trim();
+if (!ELEVENLABS_WEBHOOK_SECRET) {
+  console.warn(
+    "⚠️ ELEVENLABS_WEBHOOK_SECRET is not set; async ElevenLabs STT webhooks are disabled.",
+  );
+}
 
 // Browser CORS policy for direct relay callers.
 // - empty: disable browser CORS
@@ -1026,7 +1046,10 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
 const relayRoutesContext: RelayRoutesContext = {
   ALLOWED_ORIGINS,
   RELAY_SECRET,
+  ELEVENLABS_WEBHOOK_SECRET,
+  ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_ID,
   MAX_BODY_SIZE,
+  ELEVENLABS_WEBHOOK_MAX_BODY_SIZE,
   ELEVENLABS_TRANSCRIPTION_MODEL,
   WHISPER_TRANSCRIPTION_MODEL,
   CF_API_BASE,
@@ -1052,6 +1075,8 @@ const relayRoutesContext: RelayRoutesContext = {
   parseBooleanLike,
   parseTranslationModelFamily,
   parseTranslationPhase,
+  normalizeScribeResult,
+  startAsyncTranscriptionWithScribe,
   transcribeWithScribe,
   synthesizeWithElevenLabs,
   dubWithElevenLabs,

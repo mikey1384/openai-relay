@@ -53,6 +53,105 @@ export interface ScribeResult {
   }>;
 }
 
+type RawScribeResponse = {
+  text: string;
+  language_code: string;
+  language_probability?: number;
+  words?: ScribeWord[];
+  utterances?: ScribeUtterance[];
+};
+
+export function normalizeScribeResult(rawResult: RawScribeResponse): ScribeResult {
+  // Convert words into Whisper-compatible segments.
+  // This logic matches the BYO ElevenLabs path in ai-provider.ts.
+  const words = (rawResult.words || []).filter((w) => w.type === "word");
+
+  const segments: Array<{
+    text: string;
+    start: number;
+    end: number;
+    words?: Array<{ text: string; start: number; end: number }>;
+  }> = [];
+
+  if (words.length > 0) {
+    const SENTENCE_ENDERS = /[.!?。！？]/;
+    const MAX_SEGMENT_DURATION = 8; // seconds - keep segments short like Whisper
+
+    let currentSegment: {
+      words: typeof words;
+      speakerId: string | undefined;
+    } = { words: [], speakerId: undefined };
+
+    for (const word of words) {
+      const speakerChanged =
+        currentSegment.speakerId !== undefined &&
+        word.speaker_id !== currentSegment.speakerId;
+      const sentenceEnded =
+        currentSegment.words.length > 0 &&
+        SENTENCE_ENDERS.test(
+          currentSegment.words[currentSegment.words.length - 1]?.text || "",
+        );
+      const tooLong =
+        currentSegment.words.length > 0 &&
+        word.end - currentSegment.words[0].start > MAX_SEGMENT_DURATION;
+
+      // Start new segment on speaker change, sentence end, or if too long.
+      if (
+        (speakerChanged || sentenceEnded || tooLong) &&
+        currentSegment.words.length > 0
+      ) {
+        const segWords = currentSegment.words;
+        segments.push({
+          start: segWords[0].start,
+          end: segWords[segWords.length - 1].end,
+          text: segWords.map((w) => w.text).join(" "),
+          words: segWords.map((w) => ({
+            text: w.text,
+            start: w.start,
+            end: w.end,
+          })),
+        });
+        currentSegment = { words: [], speakerId: word.speaker_id };
+      }
+
+      currentSegment.words.push(word);
+      currentSegment.speakerId = word.speaker_id;
+    }
+
+    // Don't forget the last segment.
+    if (currentSegment.words.length > 0) {
+      const segWords = currentSegment.words;
+      segments.push({
+        start: segWords[0].start,
+        end: segWords[segWords.length - 1].end,
+        text: segWords.map((w) => w.text).join(" "),
+        words: segWords.map((w) => ({
+          text: w.text,
+          start: w.start,
+          end: w.end,
+        })),
+      });
+    }
+  } else if (rawResult.text) {
+    // Last resort: one segment with full text when word timings are unavailable.
+    segments.push({
+      text: rawResult.text,
+      start: 0,
+      end: 0,
+      words: undefined,
+    });
+  }
+
+  return {
+    text: rawResult.text,
+    language_code: rawResult.language_code,
+    language_probability: rawResult.language_probability,
+    words: rawResult.words,
+    utterances: rawResult.utterances,
+    segments,
+  };
+}
+
 /**
  * Transcribe audio using ElevenLabs Scribe API
  */
@@ -103,102 +202,63 @@ export async function transcribeWithScribe({
     );
   }
 
-  const rawResult = (await response.json()) as {
-    text: string;
-    language_code: string;
-    language_probability?: number;
-    words?: ScribeWord[];
-    utterances?: ScribeUtterance[];
-  };
+  return normalizeScribeResult((await response.json()) as RawScribeResponse);
+}
 
-  // Convert words into Whisper-compatible segments
-  // This logic matches the BYO ElevenLabs path in ai-provider.ts
-  const words = (rawResult.words || []).filter((w) => w.type === "word");
-
-  const segments: Array<{
-    text: string;
-    start: number;
-    end: number;
-    words?: Array<{ text: string; start: number; end: number }>;
-  }> = [];
-
-  if (words.length > 0) {
-    const SENTENCE_ENDERS = /[.!?。！？]/;
-    const MAX_SEGMENT_DURATION = 8; // seconds - keep segments short like Whisper
-
-    let currentSegment: {
-      words: typeof words;
-      speakerId: string | undefined;
-    } = { words: [], speakerId: undefined };
-
-    for (const word of words) {
-      const speakerChanged =
-        currentSegment.speakerId !== undefined &&
-        word.speaker_id !== currentSegment.speakerId;
-      const sentenceEnded =
-        currentSegment.words.length > 0 &&
-        SENTENCE_ENDERS.test(
-          currentSegment.words[currentSegment.words.length - 1]?.text || "",
-        );
-      const tooLong =
-        currentSegment.words.length > 0 &&
-        word.end - currentSegment.words[0].start > MAX_SEGMENT_DURATION;
-
-      // Start new segment on speaker change, sentence end, or if too long
-      if (
-        (speakerChanged || sentenceEnded || tooLong) &&
-        currentSegment.words.length > 0
-      ) {
-        const segWords = currentSegment.words;
-        segments.push({
-          start: segWords[0].start,
-          end: segWords[segWords.length - 1].end,
-          text: segWords.map((w) => w.text).join(" "),
-          words: segWords.map((w) => ({
-            text: w.text,
-            start: w.start,
-            end: w.end,
-          })),
-        });
-        currentSegment = { words: [], speakerId: word.speaker_id };
-      }
-
-      currentSegment.words.push(word);
-      currentSegment.speakerId = word.speaker_id;
-    }
-
-    // Don't forget the last segment
-    if (currentSegment.words.length > 0) {
-      const segWords = currentSegment.words;
-      segments.push({
-        start: segWords[0].start,
-        end: segWords[segWords.length - 1].end,
-        text: segWords.map((w) => w.text).join(" "),
-        words: segWords.map((w) => ({
-          text: w.text,
-          start: w.start,
-          end: w.end,
-        })),
-      });
-    }
-  } else if (rawResult.text) {
-    // Last resort: one segment with full text (no word-level data available)
-    segments.push({
-      text: rawResult.text,
-      start: 0,
-      end: 0,
-      words: undefined,
-    });
+export async function startAsyncTranscriptionWithScribe({
+  apiKey,
+  cloudStorageUrl,
+  languageCode = "auto",
+  idempotencyKey,
+  webhookId,
+  webhookMetadata,
+}: {
+  apiKey: string;
+  cloudStorageUrl: string;
+  languageCode?: string;
+  idempotencyKey?: string;
+  webhookId?: string;
+  webhookMetadata?: Record<string, unknown>;
+}): Promise<{ request_id: string }> {
+  const formData = new FormData();
+  formData.append("model_id", "scribe_v2");
+  formData.append("cloud_storage_url", cloudStorageUrl);
+  formData.append("webhook", "true");
+  if (languageCode && languageCode !== "auto") {
+    formData.append("language_code", languageCode);
+  }
+  formData.append("timestamps_granularity", "word");
+  formData.append("diarize", "true");
+  if (webhookId) {
+    formData.append("webhook_id", webhookId);
+  }
+  if (webhookMetadata && Object.keys(webhookMetadata).length > 0) {
+    formData.append("webhook_metadata", JSON.stringify(webhookMetadata));
   }
 
-  return {
-    text: rawResult.text,
-    language_code: rawResult.language_code,
-    language_probability: rawResult.language_probability,
-    words: rawResult.words,
-    utterances: rawResult.utterances,
-    segments,
-  };
+  const response = await fetch(`${ELEVENLABS_API_BASE}/speech-to-text`, {
+    method: "POST",
+    headers: {
+      "xi-api-key": apiKey,
+      ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `ElevenLabs async Scribe API error: ${response.status} - ${errorText}`,
+    );
+  }
+
+  const result = (await response.json()) as { request_id?: string };
+  const requestId = String(result?.request_id || "").trim();
+  if (!requestId) {
+    throw new Error("ElevenLabs async Scribe API returned no request_id");
+  }
+
+  return { request_id: requestId };
 }
 
 export interface TTSSegment {

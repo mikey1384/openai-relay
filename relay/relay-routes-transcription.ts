@@ -1,5 +1,12 @@
+import crypto from "node:crypto";
 import { Buffer } from "node:buffer";
+import { createWriteStream } from "node:fs";
+import * as fs from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { IncomingForm } from "formidable";
 import type { RelayRoutesContext } from "./relay-routes.js";
 import {
@@ -36,6 +43,14 @@ export async function handleTranscriptionRoutes(
   res: ServerResponse,
   ctx: RelayRoutesContext,
 ): Promise<boolean> {
+  if (
+    req.method === "POST" &&
+    req.url === ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_PATH
+  ) {
+    await handleElevenLabsSpeechToTextWebhook(req, res, ctx);
+    return true;
+  }
+
   if (req.method === "POST" && req.url === "/transcribe") {
     await handleTranscribe(req, res, ctx);
     return true;
@@ -59,10 +74,22 @@ export async function handleTranscriptionRoutes(
   return false;
 }
 
+const ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_PATH =
+  "/webhook/elevenlabs/speech-to-text";
+const ELEVENLABS_WEBHOOK_TOLERANCE_MS = 30 * 60 * 1_000;
 const TRANSCRIPTION_RESERVE_PADDING_SECONDS = Math.max(
   0,
   Number.parseInt(process.env.TRANSCRIPTION_RESERVE_PADDING_SECONDS || "2", 10),
 );
+
+type Stage5TranscriptionWebhookMetadata = {
+  stage5WebhookUrl: string;
+  stage5WebhookToken: string;
+  stage5JobId?: string;
+  requestKey?: string;
+  deviceId?: string;
+  language?: string;
+};
 
 function toReservationSeconds(durationSeconds: number): number {
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
@@ -80,6 +107,283 @@ async function probeReservationSecondsFromPath(filePath: string): Promise<number
   return reservationSeconds;
 }
 
+async function fetchR2AudioToTempFile({
+  r2Url,
+  fetchTimeoutMs,
+}: {
+  r2Url: string;
+  fetchTimeoutMs: number;
+}): Promise<{
+  tempFile: string;
+  fileSizeMB: number;
+  cleanup: () => Promise<void>;
+}> {
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), fetchTimeoutMs);
+
+  const tempFile = path.join(
+    os.tmpdir(),
+    `r2-audio-${Date.now()}-${crypto.randomUUID()}.webm`,
+  );
+  let fileSizeBytes = 0;
+
+  try {
+    const r2Response = await fetch(r2Url, { signal: abortController.signal });
+    if (!r2Response.ok) {
+      throw new Error(`Failed to fetch from R2: ${r2Response.status}`);
+    }
+    if (!r2Response.body) {
+      throw new Error("Failed to fetch from R2: missing response body");
+    }
+
+    await pipeline(
+      Readable.fromWeb(r2Response.body as any),
+      new Transform({
+        transform(chunk, _encoding, callback) {
+          if (typeof chunk === "string") {
+            fileSizeBytes += Buffer.byteLength(chunk);
+          } else {
+            fileSizeBytes += Buffer.from(chunk).length;
+          }
+          callback(null, chunk);
+        },
+      }),
+      createWriteStream(tempFile),
+    );
+  } catch (error: any) {
+    try {
+      await fs.unlink(tempFile);
+    } catch {
+      // Best effort cleanup for partial downloads.
+    }
+    if (abortController.signal.aborted) {
+      throw new Error(`Failed to fetch from R2: timed out after ${fetchTimeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+  const fileSizeMB = fileSizeBytes / (1024 * 1024);
+
+  let cleaned = false;
+  return {
+    tempFile,
+    fileSizeMB,
+    cleanup: async () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        await fs.unlink(tempFile);
+      } catch (cleanupErr: any) {
+        console.warn(
+          `⚠️ Failed to cleanup temp file ${tempFile}:`,
+          cleanupErr?.message || cleanupErr,
+        );
+      }
+    },
+  };
+}
+
+async function forwardStage5DurableTranscriptionWebhook({
+  relaySecret,
+  webhookUrl,
+  webhookToken,
+  body,
+}: {
+  relaySecret: string;
+  webhookUrl: string;
+  webhookToken: string;
+  body: {
+    success: boolean;
+    result?: unknown;
+    error?: string;
+  };
+}): Promise<void> {
+  const stage5Response = await fetch(webhookUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Relay-Secret": relaySecret,
+      "X-Stage5-Webhook-Token": webhookToken,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!stage5Response.ok) {
+    const errorText = await stage5Response.text();
+    throw new Error(
+      `Stage5 transcription webhook forwarding failed: ${stage5Response.status} ${errorText}`,
+    );
+  }
+}
+
+async function readRawBody(
+  req: IncomingMessage,
+  {
+    maxBytes,
+  }: {
+    maxBytes?: number;
+  } = {},
+): Promise<Buffer> {
+  const normalizedMaxBytes = Number.isFinite(maxBytes)
+    ? Math.max(1, Math.floor(Number(maxBytes)))
+    : Number.POSITIVE_INFINITY;
+  const chunks: Buffer[] = [];
+  let totalSize = 0;
+  for await (const chunk of req) {
+    const buffer =
+      typeof chunk === "string" ? Buffer.from(chunk, "utf8") : Buffer.from(chunk);
+    totalSize += buffer.length;
+    if (totalSize > normalizedMaxBytes) {
+      req.destroy();
+      throw new Error("Request body too large");
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks, totalSize);
+}
+
+function parseElevenLabsSignatureHeader(
+  header: string | undefined,
+): { timestamp: string; signatures: string[] } | null {
+  const value = String(header || "").trim();
+  if (!value) return null;
+
+  let timestamp = "";
+  const signatures: string[] = [];
+  for (const part of value.split(",")) {
+    const [rawKey, rawValue] = part.split("=", 2);
+    const key = String(rawKey || "").trim();
+    const parsedValue = String(rawValue || "").trim();
+    if (!key || !parsedValue) continue;
+    if (key === "t") {
+      timestamp = parsedValue;
+      continue;
+    }
+    if (key === "v0") {
+      signatures.push(parsedValue);
+    }
+  }
+
+  if (!timestamp || signatures.length === 0) {
+    return null;
+  }
+
+  return { timestamp, signatures };
+}
+
+function hasMatchingHexSignature(
+  expectedHex: string,
+  candidateHex: string,
+): boolean {
+  try {
+    const expected = Buffer.from(expectedHex, "hex");
+    const candidate = Buffer.from(candidateHex, "hex");
+    return (
+      expected.length > 0 &&
+      expected.length === candidate.length &&
+      crypto.timingSafeEqual(expected, candidate)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function verifyElevenLabsWebhookSignature({
+  rawBody,
+  signatureHeader,
+  secret,
+}: {
+  rawBody: Buffer;
+  signatureHeader: string | undefined;
+  secret: string;
+}): boolean {
+  const parsed = parseElevenLabsSignatureHeader(signatureHeader);
+  if (!parsed) return false;
+
+  const timestampMs = Number.parseInt(parsed.timestamp, 10) * 1_000;
+  if (!Number.isFinite(timestampMs)) {
+    return false;
+  }
+  if (Math.abs(Date.now() - timestampMs) > ELEVENLABS_WEBHOOK_TOLERANCE_MS) {
+    return false;
+  }
+
+  const signedPayload = Buffer.concat([
+    Buffer.from(`${parsed.timestamp}.`, "utf8"),
+    rawBody,
+  ]);
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(signedPayload)
+    .digest("hex");
+
+  return parsed.signatures.some((candidate) =>
+    hasMatchingHexSignature(expected, candidate),
+  );
+}
+
+function parseStage5TranscriptionWebhookMetadata(
+  raw: unknown,
+): Stage5TranscriptionWebhookMetadata | null {
+  if (typeof raw === "string") {
+    try {
+      return parseStage5TranscriptionWebhookMetadata(JSON.parse(raw));
+    } catch {
+      return null;
+    }
+  }
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const record = raw as Record<string, unknown>;
+  const stage5WebhookUrl = String(
+    record.stage5WebhookUrl ?? record.stage5_webhook_url ?? "",
+  ).trim();
+  const stage5WebhookToken = String(
+    record.stage5WebhookToken ?? record.stage5_webhook_token ?? "",
+  ).trim();
+
+  if (!stage5WebhookUrl || !stage5WebhookToken) {
+    return null;
+  }
+
+  const stage5JobId = String(
+    record.stage5JobId ?? record.stage5_job_id ?? "",
+  ).trim();
+  const requestKey = String(
+    record.requestKey ?? record.request_key ?? "",
+  ).trim();
+  const deviceId = String(record.deviceId ?? record.device_id ?? "").trim();
+  const language = String(record.language ?? "").trim();
+
+  return {
+    stage5WebhookUrl,
+    stage5WebhookToken,
+    ...(stage5JobId ? { stage5JobId } : {}),
+    ...(requestKey ? { requestKey } : {}),
+    ...(deviceId ? { deviceId } : {}),
+    ...(language ? { language } : {}),
+  };
+}
+
+function extractStage5WebhookErrorMessage(data: Record<string, unknown>): string {
+  const candidates = [
+    data.error,
+    data.error_message,
+    data.errorMessage,
+    data.message,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return "ElevenLabs speech-to-text webhook reported a failure";
+}
+
 function buildRelayOwnedDirectRequestOwnership(): {
   directRequestOwnership: {
     version: 1;
@@ -94,6 +398,240 @@ function buildRelayOwnedDirectRequestOwnership(): {
       updatedAt: new Date().toISOString(),
     },
   };
+}
+
+async function handleElevenLabsSpeechToTextWebhook(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: RelayRoutesContext,
+): Promise<void> {
+  const {
+    ELEVENLABS_WEBHOOK_SECRET,
+    ELEVENLABS_WEBHOOK_MAX_BODY_SIZE,
+    RELAY_SECRET,
+    MAX_BODY_SIZE,
+    getHeader,
+    sendError,
+    sendJson,
+    normalizeScribeResult,
+    toWhisperCompatibleScribeResult,
+  } = ctx;
+
+  if (!ELEVENLABS_WEBHOOK_SECRET) {
+    console.error(
+      "❌ ElevenLabs speech-to-text webhook secret is not configured",
+    );
+    sendError(res, 500, "ElevenLabs webhook secret not configured");
+    return;
+  }
+
+  try {
+    const rawBody = await readRawBody(req, {
+      maxBytes: ELEVENLABS_WEBHOOK_MAX_BODY_SIZE,
+    });
+    const signatureHeader = getHeader(req, "elevenlabs-signature");
+    if (
+      !verifyElevenLabsWebhookSignature({
+        rawBody,
+        signatureHeader,
+        secret: ELEVENLABS_WEBHOOK_SECRET,
+      })
+    ) {
+      console.error("❌ Invalid ElevenLabs speech-to-text webhook signature");
+      sendError(res, 401, "Unauthorized - invalid ElevenLabs signature");
+      return;
+    }
+
+    const rawBodyText = rawBody.toString("utf8");
+    const event = JSON.parse(rawBodyText) as Record<string, any>;
+    const data =
+      event?.data && typeof event.data === "object" ? event.data : event;
+    const metadata = parseStage5TranscriptionWebhookMetadata(
+      data?.webhook_metadata,
+    );
+    if (!metadata) {
+      console.warn(
+        "⚠️ Ignoring ElevenLabs speech-to-text webhook without Stage5 metadata",
+      );
+      sendJson(res, { status: "ignored" });
+      return;
+    }
+
+    const requestId = String(
+      data?.request_id ?? data?.requestId ?? event?.request_id ?? event?.requestId ?? "",
+    ).trim() || "unknown";
+    const payload =
+      data?.transcription && typeof data.transcription === "object"
+        ? data.transcription
+        : data;
+    const hasTranscriptionPayload =
+      payload &&
+      typeof payload === "object" &&
+      typeof payload.text === "string" &&
+      typeof payload.language_code === "string";
+    const status = String(data?.status ?? event?.status ?? "").trim().toLowerCase();
+
+    const webhookBody = hasTranscriptionPayload
+      ? {
+          success: true,
+          result: toWhisperCompatibleScribeResult(
+            normalizeScribeResult(payload as any),
+          ),
+        }
+      : {
+          success: false,
+          error: extractStage5WebhookErrorMessage(data as Record<string, unknown>),
+        };
+
+    if (!hasTranscriptionPayload && status && status !== "failed") {
+      console.log(
+        `ℹ️ Ignoring ElevenLabs speech-to-text webhook request_id=${requestId} status=${status}`,
+      );
+      sendJson(res, { status: "ignored", requestId });
+      return;
+    }
+
+    await forwardStage5DurableTranscriptionWebhook({
+      relaySecret: RELAY_SECRET,
+      webhookUrl: metadata.stage5WebhookUrl,
+      webhookToken: metadata.stage5WebhookToken,
+      body: webhookBody,
+    });
+
+    console.log(
+      `✅ ElevenLabs speech-to-text webhook forwarded request_id=${requestId} job=${metadata.stage5JobId || "unknown"}`,
+    );
+    sendJson(res, { status: "ok", requestId });
+  } catch (error: any) {
+    if (error?.message === "Request body too large") {
+      sendError(res, 413, "Request body too large");
+      return;
+    }
+    console.error(
+      "❌ ElevenLabs speech-to-text webhook handling error:",
+      error?.message || error,
+    );
+    sendError(
+      res,
+      500,
+      "ElevenLabs speech-to-text webhook handling failed",
+      error?.message || String(error),
+    );
+  }
+}
+
+async function submitAsyncR2TranscriptionInBackground({
+  cfApiBase,
+  relaySecret,
+  r2Url,
+  fetchTimeoutMs,
+  language,
+  idempotencyKey,
+  webhookId,
+  stage5WebhookUrl,
+  stage5WebhookToken,
+  stage5JobId,
+  deviceId,
+  requestKey,
+  elevenLabsKey,
+  elevenLabsModel,
+  startAsyncTranscriptionWithScribe,
+}: {
+  cfApiBase: string;
+  relaySecret: string;
+  r2Url: string;
+  fetchTimeoutMs: number;
+  language?: string;
+  idempotencyKey?: string;
+  webhookId?: string;
+  stage5WebhookUrl: string;
+  stage5WebhookToken: string;
+  stage5JobId?: string;
+  deviceId: string;
+  requestKey: string;
+  elevenLabsKey: string;
+  elevenLabsModel: string;
+  startAsyncTranscriptionWithScribe: RelayRoutesContext["startAsyncTranscriptionWithScribe"];
+}): Promise<void> {
+  const preparedAudio = await fetchR2AudioToTempFile({
+    r2Url,
+    fetchTimeoutMs,
+  });
+
+  try {
+    const reservationSeconds = await probeReservationSecondsFromPath(
+      preparedAudio.tempFile,
+    );
+    const exactConfirmResult = await confirmRelayReservation({
+      cfApiBase,
+      relaySecret,
+      payload: {
+        deviceId,
+        requestKey,
+        service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+        seconds: reservationSeconds,
+        model: elevenLabsModel,
+      },
+    });
+    if (!exactConfirmResult.ok) {
+      throw new Error(
+        `Reservation confirmation failed (${exactConfirmResult.status}): ${
+          exactConfirmResult.error || "unknown error"
+        }`,
+      );
+    }
+
+    console.log(
+      `📡 Submitting async ElevenLabs Scribe job for R2 URL with webhook callback to Stage5 (${preparedAudio.fileSizeMB.toFixed(1)}MB, ${reservationSeconds}s reserved)`,
+    );
+    const asyncRequest = await startAsyncTranscriptionWithScribe({
+      apiKey: elevenLabsKey,
+      cloudStorageUrl: r2Url,
+      languageCode: language || "auto",
+      idempotencyKey,
+      webhookId,
+      webhookMetadata: {
+        stage5WebhookUrl,
+        stage5WebhookToken,
+        stage5JobId: stage5JobId || "",
+        requestKey,
+        deviceId,
+        language: language || "auto",
+        reservationSeconds,
+      },
+    });
+    console.log(
+      `📞 ElevenLabs async transcription accepted: request_id=${asyncRequest.request_id}`,
+    );
+  } catch (error: any) {
+    const message = error?.message || String(error);
+    console.error(
+      `❌ Async ElevenLabs R2 submission failed for Stage5 job ${stage5JobId || "unknown"}:`,
+      message,
+    );
+    try {
+      await forwardStage5DurableTranscriptionWebhook({
+        relaySecret,
+        webhookUrl: stage5WebhookUrl,
+        webhookToken: stage5WebhookToken,
+        body: {
+          success: false,
+          error: message,
+        },
+      });
+      console.log(
+        `↩️ Reported async R2 submission failure back to Stage5 job ${stage5JobId || "unknown"}`,
+      );
+    } catch (forwardError: any) {
+      console.error(
+        `❌ Failed to report async R2 submission failure back to Stage5 job ${stage5JobId || "unknown"}:`,
+        forwardError?.message || String(forwardError),
+      );
+      throw forwardError;
+    }
+  } finally {
+    await preparedAudio.cleanup();
+  }
 }
 
 type DirectTranscriptionReplayResult = SharedDirectReplayResult;
@@ -1421,13 +1959,17 @@ async function handleTranscribeFromR2(
 
   const {
     CF_API_BASE,
+    ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_ID,
+    ELEVENLABS_WEBHOOK_SECRET,
+    MAX_BODY_SIZE,
     RELAY_SECRET,
     R2_FETCH_TIMEOUT_MS,
     getHeader,
     sendError,
     sendJson,
+    startAsyncTranscriptionWithScribe,
     validateRelaySecret,
-    transcribeWithScribe,
+    transcribeWithScribeWithRetries,
     toWhisperCompatibleScribeResult,
     validateR2Url,
   } = ctx;
@@ -1468,12 +2010,9 @@ async function handleTranscribeFromR2(
   }
 
   try {
-    // Parse JSON body
-    let body = "";
-    for await (const chunk of req) {
-      body += chunk;
-    }
-    const { r2Url, language, webhookUrl, webhookToken } = JSON.parse(body);
+    const { r2Url, language, webhookUrl, webhookToken } = JSON.parse(
+      (await readRawBody(req, { maxBytes: MAX_BODY_SIZE })).toString("utf8"),
+    );
 
     if (!r2Url) {
       sendError(res, 400, "r2Url is required");
@@ -1492,150 +2031,117 @@ async function handleTranscribeFromR2(
       return;
     }
 
-    console.log(`🎵 Fetching audio from R2 for transcription...`);
-
-    // Helper to process transcription (used for both sync and async modes)
-    const processTranscription = async () => {
-      // Fetch the file from R2 with timeout
-      const abortController = new AbortController();
-      const timeoutId = setTimeout(
-        () => abortController.abort(),
-        R2_FETCH_TIMEOUT_MS,
-      );
-
-      let r2Response: Response;
-      try {
-        r2Response = await fetch(r2Url, { signal: abortController.signal });
-      } finally {
-        clearTimeout(timeoutId);
-      }
-
-      if (!r2Response.ok) {
-        throw new Error(`Failed to fetch from R2: ${r2Response.status}`);
-      }
-
-      const audioBuffer = Buffer.from(await r2Response.arrayBuffer());
-      const fileSizeMB = audioBuffer.length / (1024 * 1024);
-
-      console.log(
-        `🎵 Transcribing with ElevenLabs Scribe (${fileSizeMB.toFixed(1)}MB from R2)`,
-      );
-
-      // Write to temp file for ElevenLabs
-      const fs = await import("fs");
-      const os = await import("os");
-      const path = await import("path");
-      const tempFile = path.join(os.tmpdir(), `r2-audio-${Date.now()}.webm`);
-      await fs.promises.writeFile(tempFile, audioBuffer);
-
-      try {
-        const reservationSeconds = await probeReservationSecondsFromPath(tempFile);
-        const exactConfirmResult = await confirmRelayReservation({
-          cfApiBase: CF_API_BASE,
-          relaySecret: RELAY_SECRET,
-          payload: {
-            deviceId: internalBilling.deviceId,
-            requestKey: internalBilling.requestKey,
-            service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
-            seconds: reservationSeconds,
-            model: ctx.ELEVENLABS_TRANSCRIPTION_MODEL,
-          },
-        });
-        if (!exactConfirmResult.ok) {
-          throw new Error(
-            exactConfirmResult.error || "Reservation confirmation failed"
-          );
-        }
-
-        const result = await transcribeWithScribe({
-          filePath: tempFile,
-          apiKey: elevenLabsKey,
-          languageCode: language || "auto",
-          idempotencyKey,
-        });
-        const whisperFormat = toWhisperCompatibleScribeResult(result);
-        const duration =
-          Number.isFinite(whisperFormat?.duration) && whisperFormat.duration > 0
-            ? whisperFormat.duration
-            : 0;
-
-        console.log(
-          `🎯 ElevenLabs Scribe (R2) completed! Duration: ${duration.toFixed(1)}s`,
-        );
-        return { success: true, result: whisperFormat };
-      } finally {
-        // Cleanup temp file
-        try {
-          await fs.promises.unlink(tempFile);
-        } catch (cleanupErr: any) {
-          console.warn(
-            `⚠️ Failed to cleanup temp file ${tempFile}:`,
-            cleanupErr.message,
-          );
-        }
-      }
-    };
-
-    // If webhook URL provided, process async and return immediately
     if (webhookUrl) {
-      console.log(`📞 Webhook mode: will POST result to ${webhookUrl}`);
+      if (!ELEVENLABS_WEBHOOK_SECRET) {
+        sendError(
+          res,
+          500,
+          "ElevenLabs async webhook secret not configured",
+        );
+        return;
+      }
+
+      const stage5JobId = webhookUrl.split("/").pop() || "";
+      console.log(
+        `📡 Queueing async ElevenLabs Scribe job for Stage5 webhook flow (job=${stage5JobId || "unknown"})`,
+      );
+      void submitAsyncR2TranscriptionInBackground({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        r2Url,
+        fetchTimeoutMs: R2_FETCH_TIMEOUT_MS,
+        language: language || "auto",
+        idempotencyKey,
+        webhookId: ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_ID || undefined,
+        stage5WebhookUrl: webhookUrl,
+        stage5WebhookToken: String(webhookToken || ""),
+        stage5JobId,
+        deviceId: internalBilling.deviceId,
+        requestKey: internalBilling.requestKey,
+        elevenLabsKey,
+        elevenLabsModel: ctx.ELEVENLABS_TRANSCRIPTION_MODEL,
+        startAsyncTranscriptionWithScribe,
+      }).catch((error: any) => {
+        console.error(
+          `❌ Detached async R2 transcription workflow crashed for Stage5 job ${stage5JobId || "unknown"}:`,
+          error?.message || String(error),
+        );
+      });
       sendJson(res, {
         status: "processing",
-        message: "Transcription started, result will be sent to webhook",
+        message: "Transcription queued, result will be sent to webhook",
       });
-
-      // Process in background and call webhook when done
-      processTranscription()
-        .then(async ({ result }) => {
-          try {
-            console.log(`📞 Calling webhook: ${webhookUrl}`);
-            const webhookRes = await fetch(webhookUrl, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Relay-Secret": RELAY_SECRET,
-                "X-Stage5-Webhook-Token": String(webhookToken || ""),
-              },
-              body: JSON.stringify({ success: true, result }),
-            });
-            if (webhookRes.ok) {
-              console.log(`✅ Webhook callback successful`);
-            } else {
-              console.error(`❌ Webhook callback failed: ${webhookRes.status}`);
-            }
-          } catch (webhookErr: any) {
-            console.error(`❌ Webhook callback error:`, webhookErr.message);
-          }
-        })
-        .catch(async (error: any) => {
-          console.error(
-            `❌ Transcription failed, notifying webhook:`,
-            error.message,
-          );
-          try {
-            await fetch(webhookUrl, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Relay-Secret": RELAY_SECRET,
-                "X-Stage5-Webhook-Token": String(webhookToken || ""),
-              },
-              body: JSON.stringify({ success: false, error: error.message }),
-            });
-          } catch (webhookErr: any) {
-            console.error(
-              `❌ Webhook error callback failed:`,
-              webhookErr.message,
-            );
-          }
-        });
       return;
     }
 
-    // Synchronous mode (no webhook) - original behavior
-    const { result } = await processTranscription();
-    sendJson(res, result);
+    console.log(`🎵 Fetching audio from R2 for transcription...`);
+
+    const preparedAudio = await fetchR2AudioToTempFile({
+      r2Url,
+      fetchTimeoutMs: R2_FETCH_TIMEOUT_MS,
+    });
+    try {
+      const reservationSeconds = await probeReservationSecondsFromPath(
+        preparedAudio.tempFile,
+      );
+      const exactConfirmResult = await confirmRelayReservation({
+        cfApiBase: CF_API_BASE,
+        relaySecret: RELAY_SECRET,
+        payload: {
+          deviceId: internalBilling.deviceId,
+          requestKey: internalBilling.requestKey,
+          service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
+          seconds: reservationSeconds,
+          model: ctx.ELEVENLABS_TRANSCRIPTION_MODEL,
+        },
+      });
+      if (!exactConfirmResult.ok) {
+        sendError(
+          res,
+          exactConfirmResult.status,
+          exactConfirmResult.error || "Reservation confirmation failed",
+        );
+        return;
+      }
+
+      console.log(
+        `🎵 Transcribing with ElevenLabs Scribe (${preparedAudio.fileSizeMB.toFixed(1)}MB from R2)`,
+      );
+
+      const { result, attempts } = await transcribeWithScribeWithRetries({
+        filePath: preparedAudio.tempFile,
+        apiKey: elevenLabsKey,
+        languageCode: language || "auto",
+        idempotencyKey,
+        contextLabel: "/transcribe-from-r2",
+      });
+      let whisperFormat = toWhisperCompatibleScribeResult(result);
+      if (attempts > 1) {
+        whisperFormat = {
+          ...whisperFormat,
+          retry: {
+            provider: ctx.ELEVENLABS_TRANSCRIPTION_MODEL,
+            attempts,
+          },
+        };
+      }
+      const duration =
+        Number.isFinite(whisperFormat?.duration) && whisperFormat.duration > 0
+          ? whisperFormat.duration
+          : 0;
+
+      console.log(
+        `🎯 ElevenLabs Scribe (R2) completed! Duration: ${duration.toFixed(1)}s`,
+      );
+      sendJson(res, whisperFormat);
+    } finally {
+      await preparedAudio.cleanup();
+    }
   } catch (error: any) {
+    if (error?.message === "Request body too large") {
+      sendError(res, 413, "Request body too large");
+      return;
+    }
     console.error("❌ ElevenLabs Scribe (R2) error:", error.message);
     sendError(res, 500, "Transcription from R2 failed", error.message);
   }

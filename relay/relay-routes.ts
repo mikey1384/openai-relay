@@ -55,7 +55,10 @@ export type WhisperCompatibleTranscriptionResult = any;
 export interface RelayRoutesContext {
   ALLOWED_ORIGINS: string[];
   RELAY_SECRET: string;
+  ELEVENLABS_WEBHOOK_SECRET: string;
+  ELEVENLABS_SPEECH_TO_TEXT_WEBHOOK_ID: string;
   MAX_BODY_SIZE: number;
+  ELEVENLABS_WEBHOOK_MAX_BODY_SIZE: number;
   ELEVENLABS_TRANSCRIPTION_MODEL: string;
   WHISPER_TRANSCRIPTION_MODEL: string;
   CF_API_BASE: string;
@@ -111,6 +114,21 @@ export interface RelayRoutesContext {
     raw: unknown
   ) => TranslationModelFamily | undefined;
   parseTranslationPhase: (raw: unknown) => "draft" | "review" | undefined;
+  normalizeScribeResult: (result: {
+    text: string;
+    language_code: string;
+    language_probability?: number;
+    words?: any[];
+    utterances?: any[];
+  }) => ScribeResult;
+  startAsyncTranscriptionWithScribe: (params: {
+    apiKey: string;
+    cloudStorageUrl: string;
+    languageCode?: string;
+    idempotencyKey?: string;
+    webhookId?: string;
+    webhookMetadata?: Record<string, unknown>;
+  }) => Promise<{ request_id: string }>;
   transcribeWithScribe: (params: {
     filePath: string;
     apiKey: string;
