@@ -1296,7 +1296,7 @@ async function handleDub(
           segmentAbortControllers.set(segIdx, abortController);
 
           try {
-            while (true) {
+            while (attempt < DUB_MAX_RETRIES) {
               if (disconnectWatcher.isDisconnected()) {
                 throw new Error("Client disconnected");
               }
@@ -1345,6 +1345,10 @@ async function handleDub(
                 await sleep(delay);
               }
             }
+
+            throw new Error(
+              `Segment ${segIdx + 1} exhausted retries without completion`,
+            );
           } finally {
             segmentAbortControllers.delete(segIdx);
           }
@@ -1356,20 +1360,21 @@ async function handleDub(
           DUB_MAX_CONCURRENCY,
           segmentsPayload.length,
         );
+        const claimNextPendingIndex = (): number | undefined => {
+          if (disconnectWatcher.isDisconnected()) {
+            return undefined;
+          }
+          return pendingIndices.shift();
+        };
 
         const workers = Array.from(
           { length: workerCount },
           async (_, workerIdx) => {
-            while (true) {
-              if (disconnectWatcher.isDisconnected()) {
-                return;
-              }
-
-              const current = pendingIndices.shift();
-              if (current === undefined) {
-                return;
-              }
-
+            for (
+              let current = claimNextPendingIndex();
+              current !== undefined;
+              current = claimNextPendingIndex()
+            ) {
               const seg = segmentsPayload[current];
               console.log(
                 `   • Worker ${workerIdx + 1}/${workerCount} segment ${

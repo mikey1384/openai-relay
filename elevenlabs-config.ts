@@ -724,8 +724,8 @@ export async function dubWithElevenLabs({
   // Poll for completion
   const startTime = Date.now();
   let status: DubbingStatusResponse;
-
-  while (true) {
+  let isDubbed = false;
+  while (!isDubbed) {
     if (Date.now() - startTime > maxWaitMs) {
       throw new Error("Dubbing job timed out");
     }
@@ -733,16 +733,14 @@ export async function dubWithElevenLabs({
     status = await getDubbingStatus(dubbing_id, apiKey);
     onProgress?.(`Dubbing status: ${status.status}`);
 
-    if (status.status === "dubbed") {
-      break;
-    }
-
     if (status.status === "failed") {
       throw new Error(`Dubbing failed: ${status.error || "Unknown error"}`);
     }
 
-    // Wait before next poll
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    isDubbed = status.status === "dubbed";
+    if (!isDubbed) {
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
   }
 
   // Get results
