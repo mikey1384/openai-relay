@@ -4,6 +4,7 @@ import { makeOpenAI } from "./openai-config.js";
 import { makeAnthropic, translateWithClaude } from "./anthropic-config.js";
 import {
   CF_API_BASE,
+  CLAUDE_OPUS_MODEL,
   DEFAULT_TRANSLATION_MODEL,
   isAllowedStage5TranslationModel,
   isClaudeModel,
@@ -417,7 +418,7 @@ async function translateWithOpenAiWebSearch({
   model: string;
   apiKey: string;
   maxOutputTokens?: number;
-  reasoning?: { effort?: "low" | "medium" | "high" };
+  reasoning?: { effort?: "low" | "medium" | "high" | "xhigh" };
 }): Promise<{
   model: string;
   content: string;
@@ -470,7 +471,7 @@ async function translateWithClaudeWebSearch({
   model: string;
   apiKey: string;
   maxTokens?: number;
-  effort?: "low" | "medium" | "high";
+  effort?: "low" | "medium" | "high" | "xhigh";
 }): Promise<{
   model: string;
   content: string;
@@ -496,19 +497,24 @@ async function translateWithClaudeWebSearch({
     userMessages.unshift({ role: "user", content: "Please proceed." });
   }
 
+  const useThinking = Boolean(effort && effort !== "low");
+  const useAdaptiveThinking = useThinking && model === CLAUDE_OPUS_MODEL;
+  const legacyEffort = effort === "xhigh" ? "high" : effort;
   const thinkingBudget =
-    effort === "high" ? 16_000 : effort === "medium" ? 8_000 : 0;
-  const useExtendedThinking = thinkingBudget > 0;
+    legacyEffort === "high" ? 16_000 : legacyEffort === "medium" ? 8_000 : 0;
   const resolvedMaxTokens =
     Number.isFinite(maxTokens) && Number(maxTokens) > 0
       ? Math.ceil(Number(maxTokens))
-      : useExtendedThinking
+      : useThinking
         ? 32_000
         : 16_000;
   const requestParams: any = {
     model,
-    max_tokens: useExtendedThinking
-      ? Math.max(resolvedMaxTokens, thinkingBudget + 1024)
+    max_tokens: useThinking
+      ? Math.max(
+          resolvedMaxTokens,
+          useAdaptiveThinking ? 32_000 : thinkingBudget + 1024,
+        )
       : resolvedMaxTokens,
     messages: userMessages,
     tools: [
@@ -519,13 +525,19 @@ async function translateWithClaudeWebSearch({
     ],
   };
 
-  if (systemPrompt && !useExtendedThinking) {
+  if (systemPrompt && !useThinking) {
     requestParams.system = systemPrompt;
-  } else if (systemPrompt && useExtendedThinking) {
+  } else if (systemPrompt && useThinking) {
     userMessages[0].content = `${systemPrompt}\n\n${userMessages[0].content}`;
   }
 
-  if (useExtendedThinking) {
+  if (useAdaptiveThinking) {
+    requestParams.thinking = { type: "adaptive" };
+    requestParams.output_config = {
+      ...(requestParams.output_config || {}),
+      effort,
+    };
+  } else if (useThinking) {
     requestParams.thinking = {
       type: "enabled",
       budget_tokens: thinkingBudget,
@@ -882,6 +894,7 @@ async function processTranslationJob(job: TranslationJob): Promise<void> {
           | "low"
           | "medium"
           | "high"
+          | "xhigh"
           | undefined;
         const completion = await translateWithClaude({
           messages: messages as any,

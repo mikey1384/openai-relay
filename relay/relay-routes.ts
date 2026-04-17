@@ -200,7 +200,7 @@ export interface RelayRoutesContext {
   }) => string;
   resolveTranslationReservationMaxCompletionTokens: (params: {
     model: string;
-    reasoning?: { effort?: "low" | "medium" | "high" } | null;
+    reasoning?: { effort?: "low" | "medium" | "high" | "xhigh" } | null;
   }) => number;
   isAllowedStage5TranslationModel: (model: string) => boolean;
   isClaudeModel: (model: string) => boolean;
@@ -211,7 +211,7 @@ export interface RelayRoutesContext {
     apiKey: string;
     signal?: AbortSignal;
     maxTokens?: number;
-    effort?: "low" | "medium" | "high";
+    effort?: "low" | "medium" | "high" | "xhigh";
   }) => Promise<{
     model: string;
     choices: Array<{ message: { role: string; content: string } }>;
@@ -222,7 +222,7 @@ export interface RelayRoutesContext {
     model: string;
     apiKey: string;
     maxTokens?: number;
-    effort?: "low" | "medium" | "high";
+    effort?: "low" | "medium" | "high" | "xhigh";
   }) => Promise<{
     model: string;
     content: string;

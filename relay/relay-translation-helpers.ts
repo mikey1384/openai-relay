@@ -156,10 +156,13 @@ export function resolveTranslationReservationMaxCompletionTokens({
   reasoning,
 }: {
   model: string;
-  reasoning?: { effort?: "low" | "medium" | "high" } | null;
+  reasoning?: { effort?: "low" | "medium" | "high" | "xhigh" } | null;
 }): number {
   const effort = String(reasoning?.effort || "").trim().toLowerCase();
-  if (isClaudeModel(model) && (effort === "medium" || effort === "high")) {
+  if (
+    isClaudeModel(model) &&
+    (effort === "medium" || effort === "high" || effort === "xhigh")
+  ) {
     return EXTENDED_TRANSLATION_MAX_COMPLETION_TOKENS;
   }
   return DEFAULT_TRANSLATION_MAX_COMPLETION_TOKENS;

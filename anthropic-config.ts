@@ -13,12 +13,72 @@ export interface ClaudeMessage {
   content: string;
 }
 
-// Extended thinking budget tokens by effort level
-const THINKING_BUDGET: Record<'low' | 'medium' | 'high', number> = {
+type ClaudeEffort = "low" | "medium" | "high" | "xhigh";
+
+// Legacy extended thinking budget tokens for Claude models that still support
+// budget_tokens. Claude Opus 4.7 uses adaptive thinking instead.
+const THINKING_BUDGET: Record<"low" | "medium" | "high", number> = {
   low: 0, // No extended thinking
   medium: 8000, // Moderate reasoning
   high: 16000, // Deep reasoning
 };
+
+const CLAUDE_OPUS_4_7_MODEL = "claude-opus-4-7";
+
+type ClaudeThinkingConfig =
+  | { enabled: false; maxTokens: number }
+  | {
+      enabled: true;
+      maxTokens: number;
+      apply: (requestParams: any) => void;
+      logMessage: string;
+    };
+
+function resolveClaudeThinkingConfig({
+  model,
+  maxTokens,
+  effort,
+}: {
+  model: string;
+  maxTokens: number;
+  effort?: ClaudeEffort;
+}): ClaudeThinkingConfig {
+  if (!effort || effort === "low") {
+    return { enabled: false, maxTokens };
+  }
+
+  if (model === CLAUDE_OPUS_4_7_MODEL) {
+    return {
+      enabled: true,
+      maxTokens: Math.max(maxTokens, MAX_TOKENS_WITH_THINKING),
+      apply: (requestParams) => {
+        requestParams.thinking = { type: "adaptive" };
+        requestParams.output_config = {
+          ...(requestParams.output_config || {}),
+          effort,
+        };
+      },
+      logMessage: `[anthropic-config] Adaptive thinking enabled with effort: ${effort}`,
+    };
+  }
+
+  const legacyEffort = effort === "xhigh" ? "high" : effort;
+  const budgetTokens = THINKING_BUDGET[legacyEffort];
+  return {
+    enabled: true,
+    maxTokens: Math.min(
+      MAX_TOKENS_WITH_THINKING,
+      Math.max(maxTokens, budgetTokens + 1024),
+    ),
+    apply: (requestParams) => {
+      requestParams.thinking = {
+        type: "enabled",
+        budget_tokens: budgetTokens,
+      };
+    },
+    logMessage: `[anthropic-config] Extended thinking enabled with budget: ${budgetTokens} tokens`,
+  };
+}
 
 export interface ClaudeTranslateOptions {
   messages: ClaudeMessage[];
@@ -26,7 +86,7 @@ export interface ClaudeTranslateOptions {
   apiKey: string;
   signal?: AbortSignal;
   maxTokens?: number;
-  effort?: 'low' | 'medium' | 'high';
+  effort?: ClaudeEffort;
 }
 
 const MAX_TOKENS_DEFAULT = 16000;
@@ -66,37 +126,30 @@ export async function translateWithClaude({
     userMessages.unshift({ role: "user", content: "Please proceed." });
   }
 
-  // Determine if extended thinking should be enabled
-  const budgetTokens = effort ? THINKING_BUDGET[effort] : 0;
-  const useExtendedThinking = budgetTokens > 0;
-  const resolvedMaxTokens = useExtendedThinking
-    ? Math.max(maxTokens, budgetTokens + 1024)
-    : maxTokens;
+  const thinkingConfig = resolveClaudeThinkingConfig({
+    model,
+    maxTokens,
+    effort,
+  });
 
   // Build request parameters
   const requestParams: any = {
     model,
-    max_tokens: useExtendedThinking
-      ? Math.min(MAX_TOKENS_WITH_THINKING, resolvedMaxTokens)
-      : resolvedMaxTokens,
+    max_tokens: thinkingConfig.maxTokens,
     messages: userMessages,
   };
 
   // Add system prompt (not compatible with extended thinking, prepend to first message)
-  if (systemPrompt && !useExtendedThinking) {
+  if (systemPrompt && !thinkingConfig.enabled) {
     requestParams.system = systemPrompt;
-  } else if (systemPrompt && useExtendedThinking) {
+  } else if (systemPrompt && thinkingConfig.enabled) {
     // Prepend system context to first user message when using extended thinking
     userMessages[0].content = `${systemPrompt}\n\n${userMessages[0].content}`;
   }
 
-  // Add extended thinking configuration
-  if (useExtendedThinking) {
-    requestParams.thinking = {
-      type: 'enabled',
-      budget_tokens: budgetTokens,
-    };
-    console.log(`[anthropic-config] Extended thinking enabled with budget: ${budgetTokens} tokens`);
+  if (thinkingConfig.enabled) {
+    thinkingConfig.apply(requestParams);
+    console.log(thinkingConfig.logMessage);
   }
 
   const response = await client.messages.create(requestParams, { signal });

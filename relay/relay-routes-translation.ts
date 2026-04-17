@@ -637,7 +637,12 @@ async function handleTranslateDirect(
           return;
         }
 
-        const effort = reasoning?.effort as "low" | "medium" | "high" | undefined;
+        const effort = reasoning?.effort as
+          | "low"
+          | "medium"
+          | "high"
+          | "xhigh"
+          | undefined;
         if (useWebSearch) {
           const response = await translateWithClaudeWebSearch({
             messages: messages as any,
