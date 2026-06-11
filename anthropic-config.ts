@@ -16,14 +16,14 @@ export interface ClaudeMessage {
 type ClaudeEffort = "low" | "medium" | "high" | "xhigh";
 
 // Legacy extended thinking budget tokens for Claude models that still support
-// budget_tokens. Claude Opus 4.7 uses adaptive thinking instead.
+// budget_tokens. Claude Opus 4.8 uses adaptive thinking instead.
 const THINKING_BUDGET: Record<"low" | "medium" | "high", number> = {
   low: 0, // No extended thinking
   medium: 8000, // Moderate reasoning
   high: 16000, // Deep reasoning
 };
 
-const CLAUDE_OPUS_4_7_MODEL = "claude-opus-4-7";
+const CLAUDE_OPUS_4_8_MODEL = "claude-opus-4-8";
 
 type ClaudeThinkingConfig =
   | { enabled: false; maxTokens: number }
@@ -47,7 +47,7 @@ function resolveClaudeThinkingConfig({
     return { enabled: false, maxTokens };
   }
 
-  if (model === CLAUDE_OPUS_4_7_MODEL) {
+  if (model === CLAUDE_OPUS_4_8_MODEL) {
     return {
       enabled: true,
       maxTokens: Math.max(maxTokens, MAX_TOKENS_WITH_THINKING),

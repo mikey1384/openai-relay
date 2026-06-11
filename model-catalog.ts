@@ -4,15 +4,17 @@ function canonicalizeModelId(model?: string): string {
 
 export const DEFAULT_STAGE5_TRANSLATION_MODEL = "gpt-5.1";
 export const STAGE5_REVIEW_TRANSLATION_MODEL = "gpt-5.5";
-export const STAGE5_CLAUDE_OPUS_MODEL = "claude-opus-4-7";
+export const STAGE5_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
 
 export const STAGE5_TRANSLATION_MODEL_ALIASES = {
   // Legacy GPT-5.4 values from older clients normalize to current GPT review.
   "gpt-5.4": STAGE5_REVIEW_TRANSLATION_MODEL,
-  // Legacy Opus 4.6 values from older clients normalize to current Opus.
+  // Legacy Opus values from older clients normalize to current Opus.
   "claude-opus-4-6": STAGE5_CLAUDE_OPUS_MODEL,
   "claude-opus-4.6": STAGE5_CLAUDE_OPUS_MODEL,
+  "claude-opus-4-7": STAGE5_CLAUDE_OPUS_MODEL,
   "claude-opus-4.7": STAGE5_CLAUDE_OPUS_MODEL,
+  "claude-opus-4.8": STAGE5_CLAUDE_OPUS_MODEL,
 } as const;
 
 export const STAGE5_ALLOWED_TRANSLATION_MODELS = [
