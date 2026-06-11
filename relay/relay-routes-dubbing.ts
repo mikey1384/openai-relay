@@ -299,6 +299,286 @@ async function recoverReservedDirectDubbingReplay({
   return { kind: "replay", replay };
 }
 
+const DUB_SEGMENT_CONCURRENCY = Math.max(
+  1,
+  Number.parseInt(process.env.DUB_SEGMENT_CONCURRENCY || "5", 10),
+);
+const DUB_OPENAI_SEGMENT_TIMEOUT_MS = Math.max(
+  5_000,
+  Number.parseInt(process.env.DUB_OPENAI_SEGMENT_TIMEOUT_MS || "45000", 10),
+);
+const DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS = Math.max(
+  5_000,
+  Number.parseInt(
+    process.env.DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS || "90000",
+    10,
+  ),
+);
+const DUB_SEGMENT_MAX_ATTEMPTS = 3;
+const DUB_SEGMENT_RETRY_BASE_DELAY_MS = 1_000;
+const DUB_SLOW_SEGMENT_WARN_MS = 15_000;
+// Line-based /dub chunks carry up to MAX_TTS_CHARS_PER_CHUNK (~3,500 chars),
+// far more than a subtitle segment, so they get their own larger budget.
+const DUB_CHUNK_TIMEOUT_MS = Math.max(
+  30_000,
+  Number.parseInt(process.env.DUB_CHUNK_TIMEOUT_MS || "180000", 10),
+);
+// NDJSON heartbeat cadence for streaming /dub-direct responses; clients treat
+// a few missed beats as a dead connection.
+const DUB_STREAM_HEARTBEAT_INTERVAL_MS = 10_000;
+
+class DubSegmentTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(
+      `Segment synthesis timed out after ${Math.round(timeoutMs / 1_000)}s`,
+    );
+    this.name = "DubSegmentTimeoutError";
+  }
+}
+
+function shortDubRequestKey(requestKey: string): string {
+  return requestKey.slice(-12);
+}
+
+/**
+ * Run `fn` with a per-attempt AbortSignal linked to the request's signal plus
+ * a timeout. The listener on the parent signal is always removed, so repeated
+ * attempts cannot accumulate listeners on the long-lived request signal.
+ */
+async function withSegmentTimeout<T>(
+  parentSignal: AbortSignal,
+  timeoutMs: number,
+  fn: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort();
+  if (parentSignal.aborted) {
+    controller.abort();
+  } else {
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    return await fn(controller.signal);
+  } catch (error) {
+    if (timedOut && !parentSignal.aborted) {
+      throw new DubSegmentTimeoutError(timeoutMs);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    parentSignal.removeEventListener("abort", onParentAbort);
+  }
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type DubSegmentJob = {
+  index: number;
+  text: string;
+  targetDuration?: number;
+};
+
+type DubSegmentPoolResult = {
+  segments: Array<{
+    index: number;
+    audioBase64: string;
+    targetDuration?: number;
+  }>;
+  elapsedMs: number;
+  retries: number;
+  slowestMs: number;
+  slowestIndex: number;
+};
+
+/**
+ * Synthesize dub segments through a bounded worker pool with per-attempt
+ * timeouts and retries. Per-segment timing is logged so a stalled vendor call
+ * is visible in relay logs (segment index, attempt, elapsed time) instead of
+ * silently blocking the whole request.
+ */
+async function synthesizeDubSegmentsWithPool({
+  jobs,
+  logPrefix,
+  parentSignal,
+  isAborted,
+  timeoutMs,
+  shouldRetry,
+  synthesize,
+  onProgress,
+}: {
+  jobs: DubSegmentJob[];
+  logPrefix: string;
+  parentSignal: AbortSignal;
+  isAborted: () => boolean;
+  timeoutMs: number;
+  shouldRetry: (error: unknown) => boolean;
+  synthesize: (job: DubSegmentJob, signal: AbortSignal) => Promise<Buffer>;
+  onProgress?: (completed: number, total: number) => void;
+}): Promise<DubSegmentPoolResult> {
+  const startedAt = Date.now();
+  const results: Array<{
+    index: number;
+    audioBase64: string;
+    targetDuration?: number;
+  }> = new Array(jobs.length);
+  let retries = 0;
+  let slowestMs = 0;
+  let slowestIndex = -1;
+  let completedCount = 0;
+
+  // Aborts when the request aborts OR when any segment fails terminally, so
+  // the first failure cancels in-flight work instead of letting the other
+  // workers burn their full timeout/retry budgets on a doomed request.
+  const poolAbort = new AbortController();
+  const onParentAbort = () => poolAbort.abort();
+  if (parentSignal.aborted) {
+    poolAbort.abort();
+  } else {
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const isPoolAborted = () => isAborted() || poolAbort.signal.aborted;
+
+  const buildAbortError = () => {
+    const error = new Error("Request cancelled");
+    error.name = "AbortError";
+    return error;
+  };
+
+  const runJob = async (job: DubSegmentJob, position: number) => {
+    for (let attempt = 1; attempt <= DUB_SEGMENT_MAX_ATTEMPTS; attempt += 1) {
+      if (isPoolAborted()) {
+        throw buildAbortError();
+      }
+      const attemptStartedAt = Date.now();
+      try {
+        const audio = await withSegmentTimeout(
+          poolAbort.signal,
+          timeoutMs,
+          (signal) => synthesize(job, signal),
+        );
+        const elapsed = Date.now() - attemptStartedAt;
+        if (elapsed > slowestMs) {
+          slowestMs = elapsed;
+          slowestIndex = job.index;
+        }
+        const line = `${logPrefix} ✓ segment ${position + 1}/${jobs.length} (index=${job.index}, ${job.text.length} chars) ${(elapsed / 1_000).toFixed(1)}s attempt=${attempt}`;
+        if (elapsed >= DUB_SLOW_SEGMENT_WARN_MS) {
+          console.warn(`${line} [SLOW]`);
+        } else {
+          console.log(line);
+        }
+        results[position] = {
+          index: job.index,
+          audioBase64: audio.toString("base64"),
+          targetDuration: job.targetDuration,
+        };
+        completedCount += 1;
+        try {
+          onProgress?.(completedCount, jobs.length);
+        } catch {
+          // Progress reporting must never break synthesis.
+        }
+        return;
+      } catch (error: any) {
+        const elapsed = Date.now() - attemptStartedAt;
+        if (isPoolAborted()) {
+          throw buildAbortError();
+        }
+        const retryable =
+          error instanceof DubSegmentTimeoutError || shouldRetry(error);
+        if (attempt >= DUB_SEGMENT_MAX_ATTEMPTS || !retryable) {
+          console.error(
+            `${logPrefix} ❌ segment ${position + 1}/${jobs.length} (index=${job.index}) failed after ${(elapsed / 1_000).toFixed(1)}s attempt=${attempt} retryable=${retryable}: ${error?.message || error}`,
+          );
+          throw error;
+        }
+        retries += 1;
+        const delay = DUB_SEGMENT_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+        console.warn(
+          `${logPrefix} ⚠️ segment ${position + 1}/${jobs.length} (index=${job.index}) attempt ${attempt}/${DUB_SEGMENT_MAX_ATTEMPTS} failed after ${(elapsed / 1_000).toFixed(1)}s, retrying in ${delay}ms: ${error?.message || error}`,
+        );
+        await sleepMs(delay);
+      }
+    }
+    throw new Error(`Segment index=${job.index} exhausted retries`);
+  };
+
+  let nextPosition = 0;
+  let failure: unknown = null;
+  const workers = Array.from(
+    { length: Math.min(DUB_SEGMENT_CONCURRENCY, jobs.length) },
+    async () => {
+      while (true) {
+        if (failure || isPoolAborted()) return;
+        const position = nextPosition;
+        if (position >= jobs.length) return;
+        nextPosition += 1;
+        try {
+          await runJob(jobs[position], position);
+        } catch (error) {
+          failure = failure ?? error;
+          poolAbort.abort();
+          return;
+        }
+      }
+    },
+  );
+  try {
+    await Promise.all(workers);
+  } finally {
+    parentSignal.removeEventListener("abort", onParentAbort);
+  }
+  if (failure) {
+    throw failure;
+  }
+  if (isAborted()) {
+    throw buildAbortError();
+  }
+
+  return {
+    segments: results.filter(Boolean),
+    elapsedMs: Date.now() - startedAt,
+    retries,
+    slowestMs,
+    slowestIndex,
+  };
+}
+
+function buildDubSegmentJobs(segments: any[]): DubSegmentJob[] {
+  const jobs: DubSegmentJob[] = [];
+  segments.forEach((seg: any, idx: number) => {
+    const text = String(seg?.text || seg?.translation || "").trim();
+    if (!text) return;
+    jobs.push({
+      index: Number.isFinite(seg?.index) ? Number(seg.index) : idx,
+      text,
+      targetDuration:
+        typeof seg?.targetDuration === "number" &&
+        Number.isFinite(seg.targetDuration)
+          ? seg.targetDuration
+          : undefined,
+    });
+  });
+  return jobs;
+}
+
+function logDubPoolSummary(
+  logPrefix: string,
+  pool: DubSegmentPoolResult,
+  totalCharacters: number,
+): void {
+  console.log(
+    `${logPrefix} 🎯 synthesized ${pool.segments.length} segments (${totalCharacters} chars) in ${(pool.elapsedMs / 1_000).toFixed(1)}s — retries=${pool.retries}, slowest segment index=${pool.slowestIndex} at ${(pool.slowestMs / 1_000).toFixed(1)}s`,
+  );
+}
+
 export async function handleDubbingRoutes(
   req: IncomingMessage,
   res: ServerResponse,
@@ -337,6 +617,7 @@ async function handleDubDirect(
     readJsonBody,
     makeOpenAI,
     synthesizeWithElevenLabs,
+    shouldRetrySegmentError,
   } = ctx;
 
   // Get API key from header (app sends its Stage5 API key)
@@ -387,6 +668,67 @@ async function handleDubDirect(
   const disconnectWatcher = watchClientDisconnect(req, res, () => {
     requestAbortController.abort();
   });
+
+  // Opt-in NDJSON streaming (X-Dub-Stream: 1): once synthesis starts we send
+  // heartbeat/progress lines so the client can tell "slow but alive" from a
+  // dead connection without a huge worst-case timeout. Errors before
+  // synthesis still use plain HTTP statuses.
+  const wantsDubStream = getHeader(req, "x-dub-stream") === "1";
+  let dubStreamActive = false;
+  let dubStreamHeartbeat: NodeJS.Timeout | null = null;
+  const writeDubStreamLine = (payload: Record<string, unknown>) => {
+    if (!dubStreamActive || res.writableEnded) return;
+    try {
+      res.write(`${JSON.stringify(payload)}\n`);
+    } catch {
+      // Socket gone; the disconnect watcher aborts the request.
+    }
+  };
+  const stopDubStreamHeartbeat = () => {
+    if (dubStreamHeartbeat) {
+      clearInterval(dubStreamHeartbeat);
+      dubStreamHeartbeat = null;
+    }
+  };
+  const startDubStream = (total: number) => {
+    if (dubStreamActive || res.headersSent) return;
+    res.writeHead(200, {
+      "Content-Type": "application/x-ndjson",
+      "Cache-Control": "no-cache",
+    });
+    dubStreamActive = true;
+    writeDubStreamLine({ type: "start", total });
+    dubStreamHeartbeat = setInterval(() => {
+      writeDubStreamLine({ type: "heartbeat" });
+    }, DUB_STREAM_HEARTBEAT_INTERVAL_MS);
+  };
+  const sendDubReplay = (replay: DirectDubbingReplayResult) => {
+    if (!dubStreamActive) {
+      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+      return;
+    }
+    stopDubStreamHeartbeat();
+    if (replay.kind === "success") {
+      writeDubStreamLine({
+        type: "result",
+        status: replay.status,
+        data: replay.data,
+      });
+    } else {
+      writeDubStreamLine({
+        type: "error",
+        status: replay.status,
+        error: replay.error,
+        ...(replay.details ? { details: replay.details } : {}),
+      });
+    }
+    try {
+      res.end();
+    } catch {
+      // Socket already gone.
+    }
+  };
+
   try {
     const isRequestAborted = () =>
       disconnectWatcher.isDisconnected() ||
@@ -468,7 +810,7 @@ async function handleDubDirect(
         result: replay,
         cacheSuccess: true,
       });
-      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+      sendDubReplay(replay);
     };
     const sendReplayError = (
       status: number,
@@ -486,7 +828,7 @@ async function handleDubDirect(
         entry: replayEntry,
         result: replay,
       });
-      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+      sendDubReplay(replay);
     };
     const directRequestLease = createDirectRequestLease();
     let reserveResult: Awaited<ReturnType<typeof reserveRelayCredits>> | null =
@@ -641,9 +983,17 @@ async function handleDubDirect(
       lease: directRequestLease,
     });
 
+    const dubLogPrefix = `[dub ${shortDubRequestKey(requestKey)}]`;
     console.log(
-      `🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ${ttsProvider}...`,
+      `${dubLogPrefix} 🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ${ttsProvider}, concurrency=${DUB_SEGMENT_CONCURRENCY}, stream=${wantsDubStream}...`,
     );
+
+    if (wantsDubStream) {
+      startDubStream(segments.length);
+    }
+    const reportDubProgress = (completed: number, total: number) => {
+      writeDubStreamLine({ type: "progress", completed, total });
+    };
 
     let result: any;
     let ttsModel = model;
@@ -667,38 +1017,33 @@ async function handleDubDirect(
         }
 
         ttsModel = ELEVENLABS_TTS_MODEL_ID;
-        const segmentResults: Array<{
-          index: number;
-          audioBase64: string;
-          targetDuration?: number;
-        }> = [];
-
-        for (const seg of segments) {
-          throwIfRequestAborted();
-          const text = seg.text || seg.translation || "";
-          if (!text.trim()) continue;
-
-          const audioBuffer = await synthesizeWithElevenLabs({
-            text,
-            voice,
-            modelId: ELEVENLABS_TTS_MODEL_ID,
-            format,
-            apiKey: elevenLabsKey,
-            signal: requestAbortController.signal,
-          });
-          segmentResults.push({
-            index: seg.index ?? segmentResults.length,
-            audioBase64: audioBuffer.toString("base64"),
-            targetDuration: seg.targetDuration,
-          });
-        }
+        throwIfRequestAborted();
+        const pool = await synthesizeDubSegmentsWithPool({
+          jobs: buildDubSegmentJobs(segments),
+          logPrefix: dubLogPrefix,
+          parentSignal: requestAbortController.signal,
+          isAborted: isRequestAborted,
+          timeoutMs: DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS,
+          shouldRetry: shouldRetrySegmentError,
+          synthesize: (job, signal) =>
+            synthesizeWithElevenLabs({
+              text: job.text,
+              voice,
+              modelId: ELEVENLABS_TTS_MODEL_ID,
+              format,
+              apiKey: elevenLabsKey,
+              signal,
+            }),
+          onProgress: reportDubProgress,
+        });
+        logDubPoolSummary(dubLogPrefix, pool, totalCharacters);
 
         result = {
-          segments: segmentResults,
+          segments: pool.segments,
           format,
           voice,
           model: ttsModel,
-          segmentCount: segmentResults.length,
+          segmentCount: pool.segments.length,
         };
       } else {
         // Use OpenAI TTS
@@ -720,59 +1065,47 @@ async function handleDubDirect(
         }
 
         const client = makeOpenAI(openaiKey);
-        const segmentResults: Array<{
-          index: number;
-          audioBase64: string;
-          targetDuration?: number;
-        }> = [];
-
+        throwIfRequestAborted();
         console.log(
-          `   DEBUG: About to process ${segments.length} segments for OpenAI TTS`,
+          `${dubLogPrefix} OpenAI TTS voice=${voice} model=${model} format=${format} timeout=${DUB_OPENAI_SEGMENT_TIMEOUT_MS}ms`,
         );
-        console.log(`   DEBUG: First segment:`, JSON.stringify(segments[0]));
-
-        for (const seg of segments) {
-          throwIfRequestAborted();
-          const text = seg.text || seg.translation || "";
-          if (!text.trim()) continue;
-
-          console.log(
-            `   • OpenAI TTS: voice=${voice}, model=${model}, format=${format}, text="${text.slice(0, 30)}..."`,
-          );
-
-          try {
+        const pool = await synthesizeDubSegmentsWithPool({
+          jobs: buildDubSegmentJobs(segments),
+          logPrefix: dubLogPrefix,
+          parentSignal: requestAbortController.signal,
+          isAborted: isRequestAborted,
+          timeoutMs: DUB_OPENAI_SEGMENT_TIMEOUT_MS,
+          shouldRetry: shouldRetrySegmentError,
+          synthesize: async (job, signal) => {
             const ttsRes = await client.audio.speech.create(
               {
                 model,
                 voice: voice as any,
-                input: text,
+                input: job.text,
                 response_format: format as any,
               },
-              { signal: requestAbortController.signal },
+              // Per-request timeout + no SDK-internal retries: the pool owns
+              // retry/backoff so attempts are visible in logs. Without this,
+              // the client default (600s timeout x 3 retries) lets one stalled
+              // vendor call freeze the whole dub for many minutes.
+              {
+                signal,
+                timeout: DUB_OPENAI_SEGMENT_TIMEOUT_MS,
+                maxRetries: 0,
+              },
             );
-
-            const audioBuffer = await ttsRes.arrayBuffer();
-            segmentResults.push({
-              index: seg.index ?? segmentResults.length,
-              audioBase64: Buffer.from(audioBuffer).toString("base64"),
-              targetDuration: seg.targetDuration,
-            });
-            console.log(`   ✓ OpenAI TTS segment complete`);
-          } catch (ttsErr: any) {
-            console.error(
-              `❌ OpenAI TTS error: ${ttsErr?.message || ttsErr}`,
-              ttsErr?.response?.data || "",
-            );
-            throw ttsErr;
-          }
-        }
+            return Buffer.from(await ttsRes.arrayBuffer());
+          },
+          onProgress: reportDubProgress,
+        });
+        logDubPoolSummary(dubLogPrefix, pool, totalCharacters);
 
         result = {
-          segments: segmentResults,
+          segments: pool.segments,
           format,
           voice,
           model,
-          segmentCount: segmentResults.length,
+          segmentCount: pool.segments.length,
         };
       }
     } catch (ttsError: any) {
@@ -922,12 +1255,22 @@ async function handleDubDirect(
         entry: replayContext.entry,
         result: replay,
       });
-      sendDirectDubbingReplay(res, replay, sendError, sendJson);
+      sendDubReplay(replay);
       return;
     }
 
+    if (dubStreamActive) {
+      sendDubReplay({
+        kind: "error",
+        status: 500,
+        error: "Dub synthesis failed",
+        details: error.message,
+      });
+      return;
+    }
     sendError(res, 500, "Dub synthesis failed", error.message);
   } finally {
+    stopDubStreamHeartbeat();
     disconnectWatcher.cleanup();
     stopLeaseHeartbeat?.();
   }
@@ -949,6 +1292,7 @@ async function handleDubElevenLabs(
     validateRelaySecret,
     readJsonBody,
     synthesizeWithElevenLabs,
+    shouldRetrySegmentError,
   } = ctx;
 
   if (!validateRelaySecret(req, RELAY_SECRET)) {
@@ -1039,64 +1383,39 @@ async function handleDubElevenLabs(
       0,
     );
 
+    const dubLogPrefix = `[dub-11l ${shortDubRequestKey(internalBilling.requestKey)}]`;
     console.log(
-      `🎧 Synthesizing ${segmentsPayload.length} segments (${totalCharacters} chars) with ElevenLabs voice=${voice} format=${format}`,
+      `${dubLogPrefix} 🎧 Synthesizing ${segmentsPayload.length} segments (${totalCharacters} chars) with ElevenLabs voice=${voice} format=${format}, concurrency=${DUB_SEGMENT_CONCURRENCY}`,
     );
 
-    const segmentResponses: Array<{
-      index: number;
-      audioBase64: string;
-      targetDuration?: number;
-    }> = [];
-
-    // Process segments with concurrency limit
-    const CONCURRENCY = 3;
-    for (let i = 0; i < segmentsPayload.length; i += CONCURRENCY) {
-      if (
-        disconnectWatcher.isDisconnected() ||
-        requestAbortController.signal.aborted
-      ) {
-        console.warn(
-          "⚠️ /dub-elevenlabs aborted by upstream client during synthesis",
-        );
-        return;
-      }
-      const batch = segmentsPayload.slice(i, i + CONCURRENCY);
-      const results = await Promise.all(
-        batch.map(async (seg: any) => {
-          if (
-            disconnectWatcher.isDisconnected() ||
-            requestAbortController.signal.aborted
-          ) {
-            throw new Error("Client disconnected");
-          }
-          const audioBuffer = await synthesizeWithElevenLabs({
-            text: seg.text,
-            voice,
-            format,
-            apiKey: elevenLabsKey,
-            signal: requestAbortController.signal,
-          });
-          return {
-            index: seg.index,
-            audioBase64: audioBuffer.toString("base64"),
-            targetDuration: seg.targetDuration,
-          };
+    const isAborted = () =>
+      disconnectWatcher.isDisconnected() ||
+      requestAbortController.signal.aborted;
+    const pool = await synthesizeDubSegmentsWithPool({
+      jobs: segmentsPayload as DubSegmentJob[],
+      logPrefix: dubLogPrefix,
+      parentSignal: requestAbortController.signal,
+      isAborted,
+      timeoutMs: DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS,
+      shouldRetry: shouldRetrySegmentError,
+      synthesize: (job, signal) =>
+        synthesizeWithElevenLabs({
+          text: job.text,
+          voice,
+          format,
+          apiKey: elevenLabsKey,
+          signal,
         }),
-      );
-      segmentResponses.push(...results);
-      console.log(
-        `   • Completed ${Math.min(i + CONCURRENCY, segmentsPayload.length)}/${segmentsPayload.length} segments`,
-      );
-    }
+    });
+    logDubPoolSummary(dubLogPrefix, pool, totalCharacters);
 
     sendJson(res, {
       voice,
       model: ELEVENLABS_TTS_MODEL_ID,
       format,
-      segmentCount: segmentResponses.length,
+      segmentCount: pool.segments.length,
       totalCharacters,
-      segments: segmentResponses,
+      segments: pool.segments,
     });
   } catch (error: any) {
     if (
@@ -1310,7 +1629,14 @@ async function handleDub(
                     input: seg.text,
                     response_format: format,
                   },
-                  { signal: abortController.signal },
+                  // Outer retry loop owns retries; bound each attempt so a
+                  // stalled vendor call cannot hold a worker for the SDK
+                  // default 600s.
+                  {
+                    signal: abortController.signal,
+                    timeout: DUB_OPENAI_SEGMENT_TIMEOUT_MS,
+                    maxRetries: 0,
+                  },
                 );
                 const arrayBuffer = await speech.arrayBuffer();
                 segmentResponses[segIdx] = {
@@ -1460,12 +1786,16 @@ async function handleDub(
       console.log(
         `   • Chunk ${idx + 1}/${chunks.length} (${chunk.length} chars)`,
       );
-      const speech = await client.audio.speech.create({
-        model,
-        voice,
-        input: chunk,
-        response_format: format,
-      });
+      const speech = await client.audio.speech.create(
+        {
+          model,
+          voice,
+          input: chunk,
+          response_format: format,
+        },
+        // SDK-level retries (client default 3) still apply on this path.
+        { timeout: DUB_CHUNK_TIMEOUT_MS },
+      );
       const arrayBuffer = await speech.arrayBuffer();
       chunkBuffers.push(Buffer.from(arrayBuffer));
     }
