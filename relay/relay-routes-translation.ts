@@ -25,6 +25,45 @@ import {
   estimateTranslationCompletionTokensFallback,
   estimateTranslationPromptTokenReserve,
 } from "./translation-token-estimator.js";
+import type {
+  ChatToolChoice,
+  ChatToolDefinition,
+} from "../anthropic-config.js";
+
+const MAX_TRANSLATION_TOOLS = 16;
+
+function parseChatTools(raw: unknown): ChatToolDefinition[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const tools: ChatToolDefinition[] = [];
+  for (const item of raw.slice(0, MAX_TRANSLATION_TOOLS)) {
+    const entry = item as any;
+    const fn = entry?.function;
+    const name = typeof fn?.name === "string" ? fn.name.trim() : "";
+    // Only client-defined function tools pass through; provider-native
+    // tool types (web search, computer use, ...) stay server-controlled.
+    if (entry?.type !== "function" || !name) continue;
+    tools.push({
+      type: "function",
+      function: {
+        name: name.slice(0, 64),
+        ...(typeof fn?.description === "string"
+          ? { description: fn.description.slice(0, 2048) }
+          : {}),
+        parameters:
+          fn?.parameters &&
+          typeof fn.parameters === "object" &&
+          !Array.isArray(fn.parameters)
+            ? fn.parameters
+            : { type: "object", properties: {} },
+      },
+    });
+  }
+  return tools.length > 0 ? tools : undefined;
+}
+
+function parseChatToolChoice(raw: unknown): ChatToolChoice | undefined {
+  return raw === "required" ? "required" : raw === "auto" ? "auto" : undefined;
+}
 
 type DirectTranslationReplayResult =
   | { kind: "success"; status: number; data: unknown }
@@ -407,6 +446,13 @@ async function handleTranslateDirect(
     });
     const reasoning = translationPhase === "review" ? undefined : parsed?.reasoning;
     const useWebSearch = parseBooleanLike(parsed?.webSearch) === true;
+    const tools = parseChatTools(parsed?.tools);
+    const toolChoice = parseChatToolChoice(parsed?.toolChoice);
+
+    if (tools && useWebSearch) {
+      sendError(res, 400, "tools cannot be combined with webSearch");
+      return;
+    }
     const maxCompletionTokens = resolveTranslationReservationMaxCompletionTokens({
       model,
       reasoning,
@@ -434,6 +480,7 @@ async function handleTranslateDirect(
         model,
         reasoning,
         webSearch: useWebSearch,
+        ...(tools ? { tools, toolChoice: toolChoice || "auto" } : {}),
       },
     });
     pruneDirectTranslationReplayCache();
@@ -482,6 +529,7 @@ async function handleTranslateDirect(
     const promptTokenReserve = estimateTranslationPromptTokenReserve({
       model,
       messages,
+      tools,
     });
     const directRequestLease = createDirectRequestLease();
     let reserveResult: Awaited<ReturnType<typeof reserveRelayCredits>> | null = null;
@@ -672,6 +720,8 @@ async function handleTranslateDirect(
             apiKey: anthropicKey,
             maxTokens: maxCompletionTokens,
             effort,
+            tools,
+            toolChoice,
           });
 
           result = response;
@@ -717,14 +767,36 @@ async function handleTranslateDirect(
             max_completion_tokens: maxCompletionTokens,
             messages: messages.map((m: any) => ({
               role: m.role,
-              content: m.content,
+              content: m.content ?? null,
+              // Tool-calling turns carry structured fields the plain
+              // translation flow never uses; preserve them verbatim.
+              ...(Array.isArray(m.tool_calls)
+                ? { tool_calls: m.tool_calls }
+                : {}),
+              ...(typeof m.tool_call_id === "string" && m.tool_call_id
+                ? { tool_call_id: m.tool_call_id }
+                : {}),
             })),
+            ...(tools
+              ? {
+                  tools,
+                  ...(toolChoice === "required"
+                    ? { tool_choice: "required" as const }
+                    : {}),
+                }
+              : {}),
           });
 
+          const responseMessage = response.choices[0]?.message;
           result = {
-            content: response.choices[0]?.message?.content || "",
+            content: responseMessage?.content || "",
             model,
             usage: response.usage,
+            // Tool calls (and the full message) ride along for tool-calling
+            // clients; plain translation clients keep reading `content`.
+            ...(responseMessage
+              ? { choices: [{ message: responseMessage }] }
+              : {}),
           };
           promptTokens = response.usage?.prompt_tokens || 0;
           completionTokens = response.usage?.completion_tokens || 0;

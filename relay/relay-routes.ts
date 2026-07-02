@@ -212,9 +212,17 @@ export interface RelayRoutesContext {
     signal?: AbortSignal;
     maxTokens?: number;
     effort?: "low" | "medium" | "high" | "xhigh";
+    tools?: import("../anthropic-config.js").ChatToolDefinition[];
+    toolChoice?: import("../anthropic-config.js").ChatToolChoice;
   }) => Promise<{
     model: string;
-    choices: Array<{ message: { role: string; content: string } }>;
+    choices: Array<{
+      message: {
+        role: string;
+        content: string;
+        tool_calls?: import("../anthropic-config.js").ChatToolCall[];
+      };
+    }>;
     usage: { prompt_tokens: number; completion_tokens: number };
   }>;
   translateWithClaudeWebSearch: (params: {

@@ -65,7 +65,12 @@ function normalizeUnknownToString(value: unknown): string {
   return String(value);
 }
 
-function normalizeMessages(messages: unknown): Array<{ role: string; content: string }> {
+function normalizeMessages(messages: unknown): Array<{
+  role: string;
+  content: string;
+  tool_calls?: unknown;
+  tool_call_id?: string;
+}> {
   if (!Array.isArray(messages)) {
     return [];
   }
@@ -76,7 +81,21 @@ function normalizeMessages(messages: unknown): Array<{ role: string; content: st
         ? (message as any).role
         : "user";
     const content = normalizeUnknownToString((message as any)?.content);
-    return { role, content };
+    // Tool-calling turns carry structured fields that count as prompt
+    // tokens at the provider; keep them in the estimation source.
+    const toolCalls = Array.isArray((message as any)?.tool_calls)
+      ? (message as any).tool_calls
+      : undefined;
+    const toolCallId =
+      typeof (message as any)?.tool_call_id === "string"
+        ? (message as any).tool_call_id
+        : undefined;
+    return {
+      role,
+      content,
+      ...(toolCalls ? { tool_calls: toolCalls } : {}),
+      ...(toolCallId ? { tool_call_id: toolCallId } : {}),
+    };
   });
 }
 
@@ -122,12 +141,23 @@ export function estimateTranslationPromptTokenReserve({
   model,
   messages,
   payload,
+  tools,
 }: {
   model: string;
   messages?: unknown;
   payload?: Record<string, unknown> | null;
+  tools?: unknown;
 }): number {
-  const { source, messageCount } = getPromptSource({ messages, payload });
+  const promptSource = getPromptSource({ messages, payload });
+  // Tool schemas ride in the prompt at the provider; leaving them out of
+  // the reserve can make actual spend exceed the reservation, which fails
+  // finalization after the model call already succeeded.
+  const toolsSource =
+    tools && Array.isArray(tools) && tools.length > 0
+      ? JSON.stringify(tools)
+      : "";
+  const source = promptSource.source + toolsSource;
+  const messageCount = promptSource.messageCount;
 
   if (isClaudeModel(model)) {
     return (
