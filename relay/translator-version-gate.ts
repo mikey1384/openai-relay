@@ -1,6 +1,11 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+  WIRE_UPDATE_REQUIRED,
+  WIRE_STATUS_UPDATE_REQUIRED,
+  WIRE_APP_VERSION_HEADER,
+} from "./wire-protocol.js";
 
-const TRANSLATOR_VERSION_HEADER = "x-stage5-app-version";
+const TRANSLATOR_VERSION_HEADER = WIRE_APP_VERSION_HEADER.toLowerCase();
 const DEFAULT_DOWNLOAD_URL = "https://stage5.tools";
 const DEFAULT_UPDATE_REQUIRED_MESSAGE =
   "A newer version of Translator is required to continue. Please update the app.";
@@ -93,14 +98,14 @@ export function enforceMinimumTranslatorVersion(params: {
   params.sendJson(
     params.res,
     {
-      error: "update-required",
+      error: WIRE_UPDATE_REQUIRED,
       message: DEFAULT_UPDATE_REQUIRED_MESSAGE,
       minVersion,
       clientVersion: clientVersion || undefined,
       downloadUrl: process.env.TRANSLATOR_DOWNLOAD_URL || DEFAULT_DOWNLOAD_URL,
       source: "relay",
     },
-    426
+    WIRE_STATUS_UPDATE_REQUIRED
   );
   return true;
 }
