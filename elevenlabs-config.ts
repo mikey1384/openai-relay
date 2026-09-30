@@ -1,15 +1,16 @@
 import { Buffer } from "node:buffer";
+import { synthesizeElevenV4 } from "./elevenlabs-dialogue.js";
 import * as fs from "node:fs/promises";
 
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1";
-export const ELEVENLABS_TTS_MODEL_ID = "eleven_v3";
+export const ELEVENLABS_TTS_MODEL_ID = "eleven_v4";
 export const ELEVENLABS_TTS_MAX_TEXT_CHARACTERS = 5_000;
 
 function usesElevenV3(modelId?: string): boolean {
   return (
     String(modelId || "")
       .trim()
-      .toLowerCase() === ELEVENLABS_TTS_MODEL_ID
+      .toLowerCase() === "eleven_v3"
   );
 }
 
@@ -19,7 +20,7 @@ export function assertElevenLabsTtsTextLength(text: string): void {
   }
 
   throw new Error(
-    `ElevenLabs v3 accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment`,
+    `ElevenLabs accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment`,
   );
 }
 
@@ -46,6 +47,7 @@ export interface ScribeResult {
   utterances?: ScribeUtterance[];
   // Computed segments for Whisper compatibility
   segments: Array<{
+    speaker_id?: string;
     text: string;
     start: number;
     end: number;
@@ -67,6 +69,7 @@ export function normalizeScribeResult(rawResult: RawScribeResponse): ScribeResul
   const words = (rawResult.words || []).filter((w) => w.type === "word");
 
   const segments: Array<{
+    speaker_id?: string;
     text: string;
     start: number;
     end: number;
@@ -102,6 +105,7 @@ export function normalizeScribeResult(rawResult: RawScribeResponse): ScribeResul
       ) {
         const segWords = currentSegment.words;
         segments.push({
+          speaker_id: currentSegment.speakerId,
           start: segWords[0].start,
           end: segWords[segWords.length - 1].end,
           text: segWords.map((w) => w.text).join(" "),
@@ -122,6 +126,7 @@ export function normalizeScribeResult(rawResult: RawScribeResponse): ScribeResul
     if (currentSegment.words.length > 0) {
       const segWords = currentSegment.words;
       segments.push({
+        speaker_id: currentSegment.speakerId,
         start: segWords[0].start,
         end: segWords[segWords.length - 1].end,
         text: segWords.map((w) => w.text).join(" "),
@@ -381,6 +386,10 @@ export async function synthesizeWithElevenLabs({
   const voiceId = voiceIdMap[voice.toLowerCase()] || voice;
 
   const outputSpec = resolveElevenLabsDubFormat(format);
+  if (modelId === 'eleven_v4') {
+    const audio = await synthesizeElevenV4({text, voiceId, outputFormat: outputSpec.apiOutputFormat, apiKey, signal});
+    return outputSpec.wrapPcmAsWav ? wrapPcm16LeAsWav(audio) : audio;
+  }
   const requestBody: Record<string, unknown> = {
     text,
     model_id: modelId,
