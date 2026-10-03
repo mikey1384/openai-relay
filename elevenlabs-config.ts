@@ -49,7 +49,7 @@ export interface ScribeResult {
   language_probability?: number;
   words?: ScribeWord[];
   utterances?: ScribeUtterance[];
-  // Computed segments for Whisper compatibility
+  // Computed subtitle segments (the segment shape every Translator parses)
   segments: Array<{
     speaker_id?: string;
     text: string;
@@ -68,7 +68,7 @@ type RawScribeResponse = {
 };
 
 export function normalizeScribeResult(rawResult: RawScribeResponse): ScribeResult {
-  // Convert words into Whisper-compatible segments.
+  // Convert words into the subtitle segments Translator clients parse.
   // This logic matches the BYO ElevenLabs path in ai-provider.ts.
   const words = (rawResult.words || []).filter((w) => w.type === "word");
 
@@ -82,7 +82,7 @@ export function normalizeScribeResult(rawResult: RawScribeResponse): ScribeResul
 
   if (words.length > 0) {
     const SENTENCE_ENDERS = /[.!?。！？]/;
-    const MAX_SEGMENT_DURATION = 8; // seconds - keep segments short like Whisper
+    const MAX_SEGMENT_DURATION = 8; // seconds - keep subtitle segments short
 
     let currentSegment: {
       words: typeof words;
@@ -206,9 +206,12 @@ export async function transcribeWithScribe({
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(
+    const error = new Error(
       `ElevenLabs Scribe API error: ${response.status} - ${errorText}`,
     );
+    // Lets the retry policy classify transient (5xx/429) vs permanent errors.
+    (error as Error & { status?: number }).status = response.status;
+    throw error;
   }
 
   return normalizeScribeResult((await response.json()) as RawScribeResponse);

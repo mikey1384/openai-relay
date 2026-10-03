@@ -49,7 +49,8 @@ export type RelayTranslationJob = {
   };
 };
 
-export type WhisperCompatibleTranscriptionResult = any;
+/** Transcription response shape every Translator version parses. */
+export type TranscriptionResponse = any;
 
 export interface RelayRoutesContext {
   ALLOWED_ORIGINS: string[];
@@ -59,7 +60,6 @@ export interface RelayRoutesContext {
   MAX_BODY_SIZE: number;
   ELEVENLABS_WEBHOOK_MAX_BODY_SIZE: number;
   ELEVENLABS_TRANSCRIPTION_MODEL: string;
-  WHISPER_TRANSCRIPTION_MODEL: string;
   CF_API_BASE: string;
   R2_FETCH_TIMEOUT_MS: number;
   RELAY_TRANSLATION_STALE_MS: number;
@@ -156,15 +156,6 @@ export interface RelayRoutesContext {
     maxWaitMs?: number;
     onProgress?: (status: string) => void;
   }) => Promise<DubbingResult>;
-  transcribeWithWhisperFromPath: (params: {
-    openaiKey: string;
-    filePath: string;
-    fileName: string;
-    mimeType: string;
-    language?: string;
-    prompt?: string;
-    signal?: AbortSignal;
-  }) => Promise<WhisperCompatibleTranscriptionResult>;
   transcribeWithScribeWithRetries: (params: {
     filePath: string;
     apiKey: string;
@@ -176,18 +167,7 @@ export interface RelayRoutesContext {
     result: ScribeResult;
     attempts: number;
   }>;
-  resolveDirectTranscriptionQuality: (params: {
-    explicitQualityRaw: unknown;
-    modelHint?: string;
-    modelIdHint?: string;
-  }) => {
-    useHighQuality: boolean;
-    source: "explicit" | "model-hint" | "default";
-  };
-  getWhisperFileSizeGuardMessage: (fileSizeBytes: number) => string | null;
-  toWhisperCompatibleScribeResult: (
-    result: ScribeResult
-  ) => WhisperCompatibleTranscriptionResult;
+  toTranscriptionResponse: (result: ScribeResult) => TranscriptionResponse;
   readJsonBody: (req: IncomingMessage) => Promise<any>;
   resolveTranslationModel: (params: {
     rawModel?: string;

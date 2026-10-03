@@ -37,6 +37,19 @@ import {
 } from "./relay-billing-helpers.js";
 import { probeMediaDurationSeconds } from "./audio-probe.js";
 import { buildDirectRelayTranscriptionRequestKey } from "./transcription-idempotency.js";
+import {
+  ELEVENLABS_KEY_REQUIRED_ERROR,
+  ELEVENLABS_KEY_REQUIRED_MESSAGE,
+  TRANSCRIPTION_PROVIDER_UNAVAILABLE_ERROR,
+  TRANSCRIPTION_PROVIDER_UNAVAILABLE_MESSAGE,
+  isScribeProviderUnavailableError,
+} from "./scribe-transcription.js";
+
+// Every transcription route here runs on ElevenLabs Scribe only. OpenAI
+// whisper-1 shuts down 2027-02-26 and its replacement has no timestamps, so
+// there is no Whisper path or fallback. Older Translator builds may still send
+// model=whisper-1 or qualityMode=false; those fields only feed the
+// idempotency key and logs, and the request is served (and billed) as Scribe.
 
 export async function handleTranscriptionRoutes(
   req: IncomingMessage,
@@ -414,7 +427,7 @@ async function handleElevenLabsSpeechToTextWebhook(
     sendError,
     sendJson,
     normalizeScribeResult,
-    toWhisperCompatibleScribeResult,
+    toTranscriptionResponse,
   } = ctx;
 
   if (!ELEVENLABS_WEBHOOK_SECRET) {
@@ -474,7 +487,7 @@ async function handleElevenLabsSpeechToTextWebhook(
     const webhookBody = hasTranscriptionPayload
       ? {
           success: true,
-          result: toWhisperCompatibleScribeResult(
+          result: toTranscriptionResponse(
             normalizeScribeResult(payload as any),
           ),
         }
@@ -886,17 +899,12 @@ async function handleTranscribe(
     CF_API_BASE,
     RELAY_SECRET,
     ELEVENLABS_TRANSCRIPTION_MODEL,
-    WHISPER_TRANSCRIPTION_MODEL,
-    SCRIBE_MAX_RETRIES,
     getHeader,
     sendError,
     sendJson,
     validateRelaySecret,
     transcribeWithScribeWithRetries,
-    transcribeWithWhisperFromPath,
-    resolveDirectTranscriptionQuality,
-    getWhisperFileSizeGuardMessage,
-    toWhisperCompatibleScribeResult,
+    toTranscriptionResponse,
   } = ctx;
 
   if (!validateRelaySecret(req, RELAY_SECRET)) {
@@ -910,6 +918,27 @@ async function handleTranscribe(
     sendError(res, 401, "Unauthorized - missing Stage5 billing context");
     return;
   }
+
+  // Scribe is the only transcription provider. Like /dub, fall back to the
+  // relay's own ElevenLabs key when the caller sent none; an OpenAI key alone
+  // cannot transcribe any more.
+  const elevenLabsKey =
+    getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+  if (!elevenLabsKey) {
+    console.warn(
+      `❌ /transcribe without an ElevenLabs key (openaiKeyPresent=${Boolean(
+        getHeader(req, "x-openai-key"),
+      )})`,
+    );
+    sendError(
+      res,
+      400,
+      ELEVENLABS_KEY_REQUIRED_ERROR,
+      ELEVENLABS_KEY_REQUIRED_MESSAGE,
+    );
+    return;
+  }
+
   const confirmResult = await confirmRelayReservation({
     cfApiBase: CF_API_BASE,
     relaySecret: RELAY_SECRET,
@@ -946,54 +975,19 @@ async function handleTranscribe(
       sendError(res, 400, "No file provided");
       return;
     }
-    const whisperSizeGuardMessage = getWhisperFileSizeGuardMessage(file.size);
 
     const modelHint = Array.isArray(fields.model)
       ? fields.model[0]
       : fields.model;
-    const modelIdHint = Array.isArray(fields.model_id)
-      ? fields.model_id[0]
-      : fields.model_id;
-    const qualityModeRaw =
-      (Array.isArray(fields.qualityMode)
-        ? fields.qualityMode[0]
-        : fields.qualityMode) ??
-      (Array.isArray(fields.quality_mode)
-        ? fields.quality_mode[0]
-        : fields.quality_mode);
     const language = Array.isArray(fields.language)
       ? fields.language[0]
       : fields.language;
-    const prompt = Array.isArray(fields.prompt)
-      ? fields.prompt[0]
-      : fields.prompt;
-    const { useHighQuality, source: qualitySource } =
-      resolveDirectTranscriptionQuality({
-        explicitQualityRaw: qualityModeRaw,
-        modelHint: typeof modelHint === "string" ? modelHint : undefined,
-        modelIdHint: typeof modelIdHint === "string" ? modelIdHint : undefined,
-      });
 
     console.log(
-      `🎵 /transcribe selected ${
-        useHighQuality ? "elevenlabs" : "whisper"
-      } (qualitySource=${qualitySource}) for ${file.originalFilename} (${(
-        file.size /
-        1024 /
-        1024
-      ).toFixed(1)}MB)`,
+      `🎵 /transcribe using ElevenLabs Scribe (requestedModel=${
+        modelHint || "-"
+      }) for ${file.originalFilename} (${(file.size / 1024 / 1024).toFixed(1)}MB)`,
     );
-
-    const openaiKey = getHeader(req, "x-openai-key");
-    const elevenLabsKey = getHeader(req, "x-elevenlabs-key");
-
-    let effectiveHighQuality = useHighQuality;
-    if (effectiveHighQuality && !elevenLabsKey && openaiKey) {
-      effectiveHighQuality = false;
-      console.warn(
-        "⚠️ ElevenLabs key missing for high-quality /transcribe; falling back to Whisper.",
-      );
-    }
 
     let reservationSeconds: number;
     try {
@@ -1018,9 +1012,7 @@ async function handleTranscribe(
         requestKey: internalBilling.requestKey,
         service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
         seconds: reservationSeconds,
-        model: effectiveHighQuality
-          ? ELEVENLABS_TRANSCRIPTION_MODEL
-          : WHISPER_TRANSCRIPTION_MODEL,
+        model: ELEVENLABS_TRANSCRIPTION_MODEL,
         meta: buildRelayOwnedDirectRequestOwnership(),
       },
     });
@@ -1033,123 +1025,51 @@ async function handleTranscribe(
       return;
     }
 
-    if (effectiveHighQuality) {
-      if (!elevenLabsKey) {
-        sendError(res, 500, "ElevenLabs not configured");
-        return;
-      }
-
-      try {
-        const { result: scribeResult, attempts } =
-          await transcribeWithScribeWithRetries({
-            filePath: file.filepath,
-            apiKey: elevenLabsKey,
-            languageCode: language || "auto",
-            idempotencyKey,
-            contextLabel: "/transcribe",
-            signal: requestAbortController.signal,
-          });
-        const whisperFormat = toWhisperCompatibleScribeResult(scribeResult);
-        if (attempts > 1) {
-          (whisperFormat as any).retry = {
-            provider: ELEVENLABS_TRANSCRIPTION_MODEL,
-            attempts,
-          };
-        }
-
-        console.log("🎯 Relay transcription completed with ElevenLabs.");
-        if (disconnectWatcher.isDisconnected()) {
-          console.warn("⚠️ /transcribe client disconnected after ElevenLabs success");
-          return;
-        }
-        sendJson(res, whisperFormat);
-      } catch (scribeError: any) {
-        if (
-          disconnectWatcher.isDisconnected() ||
-          requestAbortController.signal.aborted
-        ) {
-          console.warn("⚠️ /transcribe client disconnected during ElevenLabs transcription");
-          return;
-        }
-        if (!openaiKey) {
-          throw scribeError;
-        }
-
-        const attempts =
-          Number((scribeError as any)?.scribeAttempts) || SCRIBE_MAX_RETRIES;
-        if (whisperSizeGuardMessage) {
-          const reason = scribeError?.message || String(scribeError);
-          console.warn(
-            `⚠️ /transcribe cannot fall back to Whisper after ${attempts} ElevenLabs attempts: ${whisperSizeGuardMessage}`,
-          );
-          sendError(
-            res,
-            502,
-            "ElevenLabs transcription failed and Whisper fallback is unavailable for this file size",
-            `${reason}. ${whisperSizeGuardMessage}`,
-          );
-          return;
-        }
-        console.warn(
-          `⚠️ /transcribe falling back to Whisper after ${attempts} ElevenLabs attempts: ${
-            scribeError?.message || String(scribeError)
-          }`,
-        );
-        const transcription = await transcribeWithWhisperFromPath({
-          openaiKey,
+    let scribeResponse: any;
+    try {
+      const { result: scribeResult, attempts } =
+        await transcribeWithScribeWithRetries({
           filePath: file.filepath,
-          fileName: file.originalFilename || "audio.webm",
-          mimeType: file.mimetype || "audio/webm",
-          language: language || undefined,
-          prompt: prompt || undefined,
+          apiKey: elevenLabsKey,
+          languageCode: language || "auto",
+          idempotencyKey,
+          contextLabel: "/transcribe",
           signal: requestAbortController.signal,
         });
-        if (disconnectWatcher.isDisconnected()) {
-          console.warn("⚠️ /transcribe client disconnected after Whisper fallback success");
-          return;
-        }
-        sendJson(res, {
-          ...transcription,
-          fallback: {
-            from: ELEVENLABS_TRANSCRIPTION_MODEL,
-            to: WHISPER_TRANSCRIPTION_MODEL,
-            attempts,
-            reason: scribeError?.message || String(scribeError),
-          },
-        });
+      scribeResponse = toTranscriptionResponse(scribeResult);
+      if (attempts > 1) {
+        scribeResponse.retry = {
+          provider: ELEVENLABS_TRANSCRIPTION_MODEL,
+          attempts,
+        };
       }
-    } else {
-      if (!openaiKey) {
-        sendError(res, 401, "Unauthorized - missing OpenAI key");
+    } catch (scribeError: any) {
+      if (
+        disconnectWatcher.isDisconnected() ||
+        requestAbortController.signal.aborted
+      ) {
+        console.warn("⚠️ /transcribe client disconnected during ElevenLabs transcription");
         return;
       }
-      if (whisperSizeGuardMessage) {
+      // stage5-api owns this reservation and releases it on any error status.
+      if (isScribeProviderUnavailableError(scribeError)) {
         sendError(
           res,
-          413,
-          "File too large for Whisper transcription",
-          whisperSizeGuardMessage,
+          502,
+          TRANSCRIPTION_PROVIDER_UNAVAILABLE_ERROR,
+          TRANSCRIPTION_PROVIDER_UNAVAILABLE_MESSAGE,
         );
         return;
       }
-
-      const transcription = await transcribeWithWhisperFromPath({
-        openaiKey,
-        filePath: file.filepath,
-        fileName: file.originalFilename || "audio.webm",
-        mimeType: file.mimetype || "audio/webm",
-        language: language || undefined,
-        prompt: prompt || undefined,
-        signal: requestAbortController.signal,
-      });
-
-      console.log("🎯 Relay transcription completed with Whisper.");
-      if (disconnectWatcher.isDisconnected()) {
-        console.warn("⚠️ /transcribe client disconnected after Whisper success");
-        return;
-      }
-      sendJson(res, transcription);
+      throw scribeError;
     }
+
+    console.log("🎯 Relay transcription completed with ElevenLabs.");
+    if (disconnectWatcher.isDisconnected()) {
+      console.warn("⚠️ /transcribe client disconnected after ElevenLabs success");
+      return;
+    }
+    sendJson(res, scribeResponse);
   } catch (error: any) {
     if (
       disconnectWatcher.isDisconnected() ||
@@ -1183,8 +1103,7 @@ async function handleTranscribeElevenLabs(
     sendJson,
     validateRelaySecret,
     transcribeWithScribe,
-    getWhisperFileSizeGuardMessage,
-    toWhisperCompatibleScribeResult,
+    toTranscriptionResponse,
   } = ctx;
 
   if (!validateRelaySecret(req, RELAY_SECRET)) {
@@ -1239,7 +1158,6 @@ async function handleTranscribeElevenLabs(
       sendError(res, 400, "No file provided");
       return;
     }
-    const whisperSizeGuardMessage = getWhisperFileSizeGuardMessage(file.size);
 
     const language = Array.isArray(fields.language)
       ? fields.language[0]
@@ -1296,14 +1214,14 @@ async function handleTranscribeElevenLabs(
       idempotencyKey,
       signal: requestAbortController.signal,
     });
-    const whisperFormat = toWhisperCompatibleScribeResult(result);
+    const transcriptionResponse = toTranscriptionResponse(result);
 
     console.log(`🎯 ElevenLabs Scribe transcription completed!`);
     if (disconnectWatcher.isDisconnected()) {
       console.warn("⚠️ /transcribe-elevenlabs client disconnected after success");
       return;
     }
-    sendJson(res, whisperFormat);
+    sendJson(res, transcriptionResponse);
   } catch (error: any) {
     if (
       disconnectWatcher.isDisconnected() ||
@@ -1330,16 +1248,11 @@ async function handleTranscribeDirect(
     CF_API_BASE,
     RELAY_SECRET,
     ELEVENLABS_TRANSCRIPTION_MODEL,
-    WHISPER_TRANSCRIPTION_MODEL,
-    SCRIBE_MAX_RETRIES,
     getHeader,
     sendError,
     sendJson,
     transcribeWithScribeWithRetries,
-    transcribeWithWhisperFromPath,
-    resolveDirectTranscriptionQuality,
-    getWhisperFileSizeGuardMessage,
-    toWhisperCompatibleScribeResult,
+    toTranscriptionResponse,
   } = ctx;
 
   // Get API key from header (app sends its Stage5 API key)
@@ -1397,8 +1310,6 @@ async function handleTranscribeDirect(
       sendError(res, 400, "No file provided");
       return;
     }
-    const whisperSizeGuardMessage = getWhisperFileSizeGuardMessage(file.size);
-
     const language = Array.isArray(fields.language)
       ? fields.language[0]
       : fields.language;
@@ -1418,31 +1329,32 @@ async function handleTranscribeDirect(
       (Array.isArray(fields.quality_mode)
         ? fields.quality_mode[0]
         : fields.quality_mode);
-    const { useHighQuality, source: qualitySource } =
-      resolveDirectTranscriptionQuality({
-        explicitQualityRaw: qualityModeRaw,
-        modelHint: typeof modelHint === "string" ? modelHint : undefined,
-        modelIdHint: typeof modelIdHint === "string" ? modelIdHint : undefined,
-      });
 
     console.log(
-      `🎵 Direct transcription mode: ${
-        useHighQuality ? "elevenlabs" : "whisper"
-      } (qualitySource=${qualitySource}) for ${file.originalFilename} (${(
+      `🎵 Direct transcription using ElevenLabs Scribe (requestedModel=${
+        modelIdHint || modelHint || "-"
+      } qualityMode=${qualityModeRaw ?? "-"}) for ${file.originalFilename} (${(
         file.size /
         1024 /
         1024
       ).toFixed(1)}MB)`,
     );
 
-    const openaiKey = process.env.OPENAI_API_KEY;
+    // This route spends Stage5 credits on Stage5's own ElevenLabs key (users'
+    // own keys never reach the relay). Without it Scribe cannot run, and there
+    // is no other provider, so fail before any credits are held.
     const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-    let effectiveHighQuality = useHighQuality;
-    if (effectiveHighQuality && !elevenLabsKey && openaiKey) {
-      effectiveHighQuality = false;
-      console.warn(
-        "⚠️ ElevenLabs key missing for high-quality /transcribe-direct; falling back to Whisper.",
+    if (!elevenLabsKey) {
+      console.error(
+        "❌ /transcribe-direct: ELEVENLABS_API_KEY is not configured; Scribe is the only transcription provider",
       );
+      sendError(
+        res,
+        502,
+        TRANSCRIPTION_PROVIDER_UNAVAILABLE_ERROR,
+        TRANSCRIPTION_PROVIDER_UNAVAILABLE_MESSAGE,
+      );
+      return;
     }
 
     let reservationSeconds: number;
@@ -1523,9 +1435,7 @@ async function handleTranscribeDirect(
           requestKey,
           service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
           seconds: reservationSeconds,
-          model: effectiveHighQuality
-            ? ELEVENLABS_TRANSCRIPTION_MODEL
-            : WHISPER_TRANSCRIPTION_MODEL,
+          model: ELEVENLABS_TRANSCRIPTION_MODEL,
           meta: {
             directRequestLease,
           },
@@ -1678,139 +1588,28 @@ async function handleTranscribeDirect(
     });
 
     let transcriptionResult: any;
-    let billedModel: string;
+    const billedModel = ELEVENLABS_TRANSCRIPTION_MODEL;
 
     try {
-      if (effectiveHighQuality) {
-        if (!elevenLabsKey) {
-          await releaseRelayCredits({
-            cfApiBase: CF_API_BASE,
-            relaySecret: RELAY_SECRET,
-            payload: {
-              deviceId,
-              requestKey,
-              service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
-            },
-          });
-          sendReplayError(500, "ElevenLabs not configured");
-          return;
-        }
-
-        try {
-          const { result, attempts } = await transcribeWithScribeWithRetries({
-            filePath: file.filepath,
-            apiKey: elevenLabsKey,
-            languageCode: language || "auto",
-            idempotencyKey,
-            contextLabel: "/transcribe-direct",
-          });
-          transcriptionResult = toWhisperCompatibleScribeResult(result);
-          if (attempts > 1) {
-            transcriptionResult = {
-              ...transcriptionResult,
-              retry: {
-                provider: ELEVENLABS_TRANSCRIPTION_MODEL,
-                attempts,
-              },
-            };
-          }
-          billedModel = ELEVENLABS_TRANSCRIPTION_MODEL;
-        } catch (scribeError: any) {
-          if (!openaiKey) {
-            throw scribeError;
-          }
-
-          const attempts =
-            Number((scribeError as any)?.scribeAttempts) || SCRIBE_MAX_RETRIES;
-          if (whisperSizeGuardMessage) {
-            const reason = scribeError?.message || String(scribeError);
-            console.warn(
-              `⚠️ /transcribe-direct cannot fall back to Whisper after ${attempts} ElevenLabs attempts: ${whisperSizeGuardMessage}`,
-            );
-            await releaseRelayCredits({
-              cfApiBase: CF_API_BASE,
-              relaySecret: RELAY_SECRET,
-              payload: {
-                deviceId,
-                requestKey,
-                service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
-              },
-            });
-            sendReplayError(
-              502,
-              "ElevenLabs transcription failed and Whisper fallback is unavailable for this file size",
-              `${reason}. ${whisperSizeGuardMessage}`,
-            );
-            return;
-          }
-          console.warn(
-            `⚠️ /transcribe-direct falling back to Whisper after ${attempts} ElevenLabs attempts: ${
-              scribeError?.message || String(scribeError)
-            }`,
-          );
-
-          transcriptionResult = await transcribeWithWhisperFromPath({
-            openaiKey,
-            filePath: file.filepath,
-            fileName: file.originalFilename || "audio.webm",
-            mimeType: file.mimetype || "audio/webm",
-            language: language || undefined,
-            prompt: prompt || undefined,
-          });
-          transcriptionResult = {
-            ...transcriptionResult,
-            fallback: {
-              from: ELEVENLABS_TRANSCRIPTION_MODEL,
-              to: WHISPER_TRANSCRIPTION_MODEL,
-              attempts,
-              reason: scribeError?.message || String(scribeError),
-            },
-          };
-          billedModel = WHISPER_TRANSCRIPTION_MODEL;
-        }
-      } else {
-        if (!openaiKey) {
-          await releaseRelayCredits({
-            cfApiBase: CF_API_BASE,
-            relaySecret: RELAY_SECRET,
-            payload: {
-              deviceId,
-              requestKey,
-              service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
-            },
-          });
-          sendReplayError(500, "OpenAI not configured");
-          return;
-        }
-        if (whisperSizeGuardMessage) {
-          await releaseRelayCredits({
-            cfApiBase: CF_API_BASE,
-            relaySecret: RELAY_SECRET,
-            payload: {
-              deviceId,
-              requestKey,
-              service: STAGE5_RELAY_BILLING_SERVICES.TRANSCRIPTION,
-            },
-          });
-          sendReplayError(
-            413,
-            "File too large for Whisper transcription",
-            whisperSizeGuardMessage,
-          );
-          return;
-        }
-
-        transcriptionResult = await transcribeWithWhisperFromPath({
-          openaiKey,
-          filePath: file.filepath,
-          fileName: file.originalFilename || "audio.webm",
-          mimeType: file.mimetype || "audio/webm",
-          language: language || undefined,
-          prompt: prompt || undefined,
-        });
-        billedModel = WHISPER_TRANSCRIPTION_MODEL;
+      const { result, attempts } = await transcribeWithScribeWithRetries({
+        filePath: file.filepath,
+        apiKey: elevenLabsKey,
+        languageCode: language || "auto",
+        idempotencyKey,
+        contextLabel: "/transcribe-direct",
+      });
+      transcriptionResult = toTranscriptionResponse(result);
+      if (attempts > 1) {
+        transcriptionResult = {
+          ...transcriptionResult,
+          retry: {
+            provider: ELEVENLABS_TRANSCRIPTION_MODEL,
+            attempts,
+          },
+        };
       }
     } catch (transcriptionError: any) {
+      // Same release as every other vendor failure: the held credits go back.
       await releaseRelayCredits({
         cfApiBase: CF_API_BASE,
         relaySecret: RELAY_SECRET,
@@ -1821,6 +1620,14 @@ async function handleTranscribeDirect(
           meta: { reason: "vendor-error", message: transcriptionError?.message || String(transcriptionError) },
         },
       });
+      if (isScribeProviderUnavailableError(transcriptionError)) {
+        sendReplayError(
+          502,
+          TRANSCRIPTION_PROVIDER_UNAVAILABLE_ERROR,
+          TRANSCRIPTION_PROVIDER_UNAVAILABLE_MESSAGE,
+        );
+        return;
+      }
       throw transcriptionError;
     }
 
@@ -1970,7 +1777,7 @@ async function handleTranscribeFromR2(
     startAsyncTranscriptionWithScribe,
     validateRelaySecret,
     transcribeWithScribeWithRetries,
-    toWhisperCompatibleScribeResult,
+    toTranscriptionResponse,
     validateR2Url,
   } = ctx;
 
@@ -2115,10 +1922,10 @@ async function handleTranscribeFromR2(
         idempotencyKey,
         contextLabel: "/transcribe-from-r2",
       });
-      let whisperFormat = toWhisperCompatibleScribeResult(result);
+      let transcriptionResponse = toTranscriptionResponse(result);
       if (attempts > 1) {
-        whisperFormat = {
-          ...whisperFormat,
+        transcriptionResponse = {
+          ...transcriptionResponse,
           retry: {
             provider: ctx.ELEVENLABS_TRANSCRIPTION_MODEL,
             attempts,
@@ -2126,20 +1933,30 @@ async function handleTranscribeFromR2(
         };
       }
       const duration =
-        Number.isFinite(whisperFormat?.duration) && whisperFormat.duration > 0
-          ? whisperFormat.duration
+        Number.isFinite(transcriptionResponse?.duration) &&
+        transcriptionResponse.duration > 0
+          ? transcriptionResponse.duration
           : 0;
 
       console.log(
         `🎯 ElevenLabs Scribe (R2) completed! Duration: ${duration.toFixed(1)}s`,
       );
-      sendJson(res, whisperFormat);
+      sendJson(res, transcriptionResponse);
     } finally {
       await preparedAudio.cleanup();
     }
   } catch (error: any) {
     if (error?.message === "Request body too large") {
       sendError(res, 413, "Request body too large");
+      return;
+    }
+    if (isScribeProviderUnavailableError(error)) {
+      sendError(
+        res,
+        502,
+        TRANSCRIPTION_PROVIDER_UNAVAILABLE_ERROR,
+        TRANSCRIPTION_PROVIDER_UNAVAILABLE_MESSAGE,
+      );
       return;
     }
     console.error("❌ ElevenLabs Scribe (R2) error:", error.message);

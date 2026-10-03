@@ -18,6 +18,11 @@ import {
   dubWithElevenLabs,
 } from "./elevenlabs-config.js";
 import {
+  STAGE5_SCRIBE_BILLING_MODEL,
+  toTranscriptionResponse,
+  transcribeWithScribeRetrying,
+} from "./relay/scribe-transcription.js";
+import {
   getHeader,
   getCorsOrigin,
   sendError,
@@ -90,18 +95,13 @@ const RELAY_TRANSLATION_STALE_MS = Math.max(
     10,
   ),
 );
-const WHISPER_TRANSCRIPTION_MODEL = "whisper-1";
-const ELEVENLABS_TRANSCRIPTION_MODEL = "elevenlabs-scribe";
-const WHISPER_MAX_FILE_SIZE_BYTES = Math.max(
-  1,
-  Number.parseInt(
-    process.env.WHISPER_MAX_FILE_SIZE_BYTES || String(25 * 1024 * 1024),
-    10,
-  ),
-);
+// Transcription is ElevenLabs Scribe only (OpenAI whisper-1 shuts down
+// 2027-02-26 and its replacement has no timestamps). There is no OpenAI
+// fallback, so transient Scribe failures get one more attempt than before.
+const ELEVENLABS_TRANSCRIPTION_MODEL = STAGE5_SCRIBE_BILLING_MODEL;
 const SCRIBE_MAX_RETRIES = Math.max(
   1,
-  Number.parseInt(process.env.SCRIBE_MAX_RETRIES || "3", 10),
+  Number.parseInt(process.env.SCRIBE_MAX_RETRIES || "4", 10),
 );
 const SCRIBE_RETRY_BASE_DELAY_MS = Math.max(
   100,
@@ -109,7 +109,7 @@ const SCRIBE_RETRY_BASE_DELAY_MS = Math.max(
 );
 const SCRIBE_RETRY_MAX_DELAY_MS = Math.max(
   SCRIBE_RETRY_BASE_DELAY_MS,
-  Number.parseInt(process.env.SCRIBE_RETRY_MAX_DELAY_MS || "4000", 10),
+  Number.parseInt(process.env.SCRIBE_RETRY_MAX_DELAY_MS || "8000", 10),
 );
 
 // Fail fast if RELAY_SECRET is missing - this is critical for security
@@ -201,154 +201,6 @@ function validateR2Url(urlString: string): { valid: boolean; error?: string } {
   } catch {
     return { valid: false, error: "Invalid R2 URL format" };
   }
-}
-
-function resolveDirectTranscriptionQuality({
-  explicitQualityRaw,
-  modelHint,
-  modelIdHint,
-}: {
-  explicitQualityRaw: unknown;
-  modelHint?: string;
-  modelIdHint?: string;
-}): {
-  useHighQuality: boolean;
-  source: "explicit" | "model-hint" | "default";
-} {
-  const explicit = parseBooleanLike(explicitQualityRaw);
-  if (typeof explicit === "boolean") {
-    return { useHighQuality: explicit, source: "explicit" };
-  }
-
-  const combinedHints = [modelHint, modelIdHint]
-    .map((v) => (typeof v === "string" ? v.trim().toLowerCase() : ""))
-    .filter(Boolean)
-    .join(" ");
-  const hintTokens = combinedHints.split(/[^a-z0-9]+/).filter(Boolean);
-  if (hintTokens.includes("whisper")) {
-    return { useHighQuality: false, source: "model-hint" };
-  }
-  if (hintTokens.includes("scribe") || hintTokens.includes("elevenlabs")) {
-    return { useHighQuality: true, source: "model-hint" };
-  }
-
-  return { useHighQuality: true, source: "default" };
-}
-
-function formatSizeMB(bytes: number): string {
-  return (bytes / (1024 * 1024)).toFixed(1);
-}
-
-function getWhisperFileSizeGuardMessage(fileSizeBytes: number): string | null {
-  if (!Number.isFinite(fileSizeBytes) || fileSizeBytes <= 0) return null;
-  if (fileSizeBytes <= WHISPER_MAX_FILE_SIZE_BYTES) return null;
-  return `File is ${formatSizeMB(fileSizeBytes)}MB; Whisper supports up to ${formatSizeMB(WHISPER_MAX_FILE_SIZE_BYTES)}MB per request.`;
-}
-
-function toWhisperCompatibleScribeResult(result: any) {
-  const segments = Array.isArray(result?.segments) ? result.segments : [];
-  const duration =
-    segments.length > 0
-      ? Math.max(
-          ...segments.map((segment: any) =>
-            Number.isFinite(segment?.end) ? segment.end : 0,
-          ),
-        )
-      : 0;
-
-  return {
-    text: String(result?.text ?? ""),
-    language:
-      typeof result?.language_code === "string"
-        ? result.language_code
-        : undefined,
-    duration,
-    approx_duration: duration,
-    model: ELEVENLABS_TRANSCRIPTION_MODEL,
-    segments: segments.map((segment: any, idx: number) => ({
-      id: idx,
-      start: Number.isFinite(segment?.start) ? segment.start : 0,
-      end: Number.isFinite(segment?.end) ? segment.end : 0,
-      text: String(segment?.text ?? ""),
-      words: Array.isArray(segment?.words)
-        ? segment.words.map((word: any) => ({
-            word: String(word?.text ?? ""),
-            start: Number.isFinite(word?.start) ? word.start : 0,
-            end: Number.isFinite(word?.end) ? word.end : 0,
-          }))
-        : [],
-    })),
-    words: segments.flatMap((segment: any) =>
-      Array.isArray(segment?.words)
-        ? segment.words.map((word: any) => ({
-            word: String(word?.text ?? ""),
-            start: Number.isFinite(word?.start) ? word.start : 0,
-            end: Number.isFinite(word?.end) ? word.end : 0,
-          }))
-        : [],
-    ),
-  };
-}
-
-async function transcribeWithWhisperFromPath({
-  openaiKey,
-  filePath,
-  fileName,
-  mimeType,
-  language,
-  prompt,
-  signal,
-}: {
-  openaiKey: string;
-  filePath: string;
-  fileName: string;
-  mimeType: string;
-  language?: string;
-  prompt?: string;
-  signal?: AbortSignal;
-}) {
-  const client = makeOpenAI(openaiKey);
-  const fs = await import("fs");
-  const fileBuffer = await fs.promises.readFile(filePath);
-  const fileBlob = new File([fileBuffer as unknown as BlobPart], fileName, {
-    type: mimeType,
-  });
-
-  const whisperResult = (await client.audio.transcriptions.create(
-    {
-      file: fileBlob,
-      model: WHISPER_TRANSCRIPTION_MODEL,
-      language: language || undefined,
-      prompt: prompt || undefined,
-      response_format: "verbose_json",
-      timestamp_granularities: ["word", "segment"],
-    },
-    signal ? { signal } : undefined,
-  )) as any;
-
-  const durationFromSegments =
-    Array.isArray(whisperResult?.segments) && whisperResult.segments.length > 0
-      ? Math.max(
-          ...whisperResult.segments.map((segment: any) =>
-            Number.isFinite(segment?.end) ? segment.end : 0,
-          ),
-        )
-      : 0;
-  const duration =
-    Number.isFinite(whisperResult?.duration) && whisperResult.duration > 0
-      ? whisperResult.duration
-      : durationFromSegments;
-
-  return {
-    ...whisperResult,
-    model: WHISPER_TRANSCRIPTION_MODEL,
-    duration,
-    approx_duration:
-      Number.isFinite(whisperResult?.approx_duration) &&
-      whisperResult.approx_duration > 0
-        ? whisperResult.approx_duration
-        : duration,
-  };
 }
 
 function mapMessagesToOpenAiResponsesInput(messages: any[]): any[] {
@@ -789,51 +641,22 @@ async function transcribeWithScribeWithRetries({
   result: Awaited<ReturnType<typeof transcribeWithScribe>>;
   attempts: number;
 }> {
-  let lastError: any = null;
-  let attempts = 0;
-
-  for (let attempt = 1; attempt <= SCRIBE_MAX_RETRIES; attempt += 1) {
-    attempts = attempt;
-    try {
-      throwIfAborted(signal);
-      const result = await transcribeWithScribe({
+  return transcribeWithScribeRetrying({
+    transcribe: () =>
+      transcribeWithScribe({
         filePath,
         apiKey,
         languageCode,
         idempotencyKey,
         signal,
-      });
-      return { result, attempts };
-    } catch (error: any) {
-      lastError = error;
-      if (signal?.aborted || error?.name === "AbortError") {
-        break;
-      }
-      const retryable = shouldRetrySegmentError(error);
-      if (!retryable || attempt >= SCRIBE_MAX_RETRIES) {
-        break;
-      }
-
-      const delay = Math.min(
-        SCRIBE_RETRY_MAX_DELAY_MS,
-        SCRIBE_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1),
-      );
-      console.warn(
-        `⚠️ ${contextLabel} ElevenLabs Scribe attempt ${attempt}/${SCRIBE_MAX_RETRIES} failed, retrying in ${delay}ms: ${
-          error?.message || String(error)
-        }`,
-      );
-      await sleepWithAbort(delay, signal);
-    }
-  }
-
-  if (lastError && typeof lastError === "object") {
-    (lastError as any).scribeAttempts = attempts;
-  }
-  throw (
-    lastError ||
-    new Error(`${contextLabel} ElevenLabs Scribe failed without a response`)
-  );
+      }),
+    maxAttempts: SCRIBE_MAX_RETRIES,
+    baseDelayMs: SCRIBE_RETRY_BASE_DELAY_MS,
+    maxDelayMs: SCRIBE_RETRY_MAX_DELAY_MS,
+    sleep: sleepWithAbort,
+    contextLabel,
+    signal,
+  });
 }
 
 async function processTranslationJob(job: TranslationJob): Promise<void> {
@@ -1066,7 +889,6 @@ const relayRoutesContext: RelayRoutesContext = {
   MAX_BODY_SIZE,
   ELEVENLABS_WEBHOOK_MAX_BODY_SIZE,
   ELEVENLABS_TRANSCRIPTION_MODEL,
-  WHISPER_TRANSCRIPTION_MODEL,
   CF_API_BASE,
   R2_FETCH_TIMEOUT_MS,
   RELAY_TRANSLATION_STALE_MS,
@@ -1095,11 +917,8 @@ const relayRoutesContext: RelayRoutesContext = {
   transcribeWithScribe,
   synthesizeWithElevenLabs,
   dubWithElevenLabs,
-  transcribeWithWhisperFromPath,
   transcribeWithScribeWithRetries,
-  resolveDirectTranscriptionQuality,
-  getWhisperFileSizeGuardMessage,
-  toWhisperCompatibleScribeResult,
+  toTranscriptionResponse,
   readJsonBody,
   resolveTranslationModel,
   resolveTranslationReservationMaxCompletionTokens,
@@ -1124,8 +943,8 @@ const server = createServer((req, res) =>
 );
 
 server.listen(PORT, () => {
-  console.log(`🚀 OpenAI Relay server running on port ${PORT}`);
-  console.log(`📡 Ready to process real transcriptions via OpenAI`);
+  console.log(`🚀 Stage5 relay server running on port ${PORT}`);
+  console.log(`📡 Transcription: ElevenLabs Scribe only`);
 });
 
 setInterval(() => pruneTranslationJobs(), 60_000);

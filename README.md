@@ -40,10 +40,9 @@ curl -X POST http://localhost:3000/translate \
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 
-# Test transcription endpoint (requires audio file)
-curl -X POST http://localhost:3000/transcribe \
-  -F "file=@audio.mp3" \
-  -F "model=whisper-1"
+# Transcription (/transcribe) is ElevenLabs Scribe only and needs the relay
+# secret plus a Stage5 billing reservation, so it is exercised through
+# stage5-api rather than with a bare curl.
 ```
 
 ## 🌩️ Fly.io Deployment
@@ -101,20 +100,28 @@ flyctl scale count 2
 
 ## 📡 API Endpoints
 
-### POST /transcribe
+### POST /transcribe, POST /transcribe-direct
 
-Proxy to OpenAI's audio transcription API.
+Speech-to-text with ElevenLabs Scribe (`scribe_v2`) only. OpenAI `whisper-1`
+shuts down 2027-02-26 and its replacement returns no timestamps, so there is
+no Whisper path or fallback. Older Translator builds may still send
+`model=whisper-1` or `qualityMode=false`; those requests are served by Scribe
+and billed at the Scribe price.
 
-**Headers:**
+**Body (multipart/form-data):**
 
-- `Content-Type: multipart/form-data`
-
-**Body:**
-
-- `file`: Audio file (mp3, wav, etc.)
-- `model`: Model name (default: whisper-1)
+- `file`: Audio file (mp3, wav, webm, etc.)
 - `language`: Optional language code
-- `prompt`: Optional context prompt
+- `model` / `model_id` / `qualityMode` / `prompt`: accepted for older clients;
+  they no longer change the provider or the price
+
+**Errors:**
+
+- `502 { "error": "transcription-provider-unavailable", "details": "Transcription is temporarily unavailable. Please try again in a few minutes." }`
+  after Scribe retries (5xx, 429, timeouts, network) are exhausted; held
+  credits are released.
+- `400 { "error": "elevenlabs-key-required", "details": "..." }` from
+  `/transcribe` when no ElevenLabs key is available.
 
 ### POST /translate
 
@@ -146,11 +153,8 @@ const openai = new OpenAI({
   maxRetries: 3,
 });
 
-// Update endpoint calls
-const transcription = await openai.audio.transcriptions.create({
-  // ... same parameters
-}); // Will call https://translator-relay.fly.dev/transcribe
-
+// Update endpoint calls (transcription is not proxied to OpenAI any more;
+// stage5-api calls the relay's Scribe-only /transcribe directly)
 const completion = await openai.chat.completions.create({
   // ... same parameters
 }); // Will call https://translator-relay.fly.dev/translate
