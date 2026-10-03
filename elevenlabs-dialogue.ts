@@ -19,7 +19,7 @@ export function splitDialogueText(text: string): string[] {
 }
 
 
-function withoutLeadingId3Tags(buffer: Buffer): Buffer {
+export function stripLeadingId3Tags(buffer: Buffer): Buffer {
   let offset = 0;
   while (buffer.length >= offset + 10 && buffer.toString('ascii', offset, offset + 3) === 'ID3') {
     const sizeBytes = buffer.subarray(offset + 6, offset + 10);
@@ -61,5 +61,5 @@ export async function synthesizeElevenV4({
   // An ID3 tag at an internal MP3 boundary is decoded as a broken packet.
   // Keep the first file's metadata and join only MPEG frames thereafter.
   return Buffer.concat(audio.map((part, index) => index > 0 && outputFormat.startsWith('mp3_')
-    ? withoutLeadingId3Tags(part) : part));
+    ? stripLeadingId3Tags(part) : part));
 }

@@ -7,7 +7,6 @@ import type {
   MemoryRelayJobLike,
   RelayJobStatus,
 } from "./relay-job-sync.js";
-import { handleSpeechRoutes } from "./relay-routes-speech.js";
 import { handleTranscriptionRoutes } from "./relay-routes-transcription.js";
 import { handleTranslationRoutes } from "./relay-routes-translation.js";
 import { handleDubbingRoutes } from "./relay-routes-dubbing.js";
@@ -294,9 +293,8 @@ export async function handleRelayRequest(
     return;
   }
 
-  if (await handleSpeechRoutes(req, res, ctx)) {
-    return;
-  }
+  // The OpenAI-backed POST /speech route was removed: it had no callers in
+  // stage5-api or the Translator, and OpenAI TTS shuts down 2027-01-06.
 
   if (await handleTranscriptionRoutes(req, res, ctx)) {
     return;

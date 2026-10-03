@@ -5,6 +5,11 @@ import {
   ELEVENLABS_TTS_MAX_TEXT_CHARACTERS,
   ELEVENLABS_TTS_MODEL_ID,
 } from "../elevenlabs-config.js";
+import { stripLeadingId3Tags } from "../elevenlabs-dialogue.js";
+import {
+  resolveElevenLabsDubFormatName,
+  resolveElevenLabsDubVoice,
+} from "../elevenlabs-voices.js";
 import type { RelayRoutesContext } from "./relay-routes.js";
 import {
   createDirectRequestLease,
@@ -302,10 +307,6 @@ async function recoverReservedDirectDubbingReplay({
 const DUB_SEGMENT_CONCURRENCY = Math.max(
   1,
   Number.parseInt(process.env.DUB_SEGMENT_CONCURRENCY || "5", 10),
-);
-const DUB_OPENAI_SEGMENT_TIMEOUT_MS = Math.max(
-  5_000,
-  Number.parseInt(process.env.DUB_OPENAI_SEGMENT_TIMEOUT_MS || "45000", 10),
 );
 const DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS = Math.max(
   5_000,
@@ -615,7 +616,6 @@ async function handleDubDirect(
     sendError,
     sendJson,
     readJsonBody,
-    makeOpenAI,
     synthesizeWithElevenLabs,
     shouldRetrySegmentError,
   } = ctx;
@@ -746,27 +746,28 @@ async function handleDubDirect(
 
     const parsed = await readJsonBody(req);
     const segments = parsed?.segments || [];
-    const voice = parsed?.voice || "alloy";
-    const model = parsed?.model || "tts-1";
-    const format = parsed?.format || "mp3";
-    const ttsProvider = parsed?.ttsProvider || "openai";
+    // Managed dubbing is ElevenLabs-only (OpenAI TTS shuts down 2027-01-06).
+    // Older Translator builds still send ttsProvider "openai", an OpenAI
+    // model and/or an OpenAI voice name; those are synthesized with
+    // ElevenLabs v4 using the shared voice map and billed at the v4 price.
+    const voice = resolveElevenLabsDubVoice(parsed?.voice);
+    const format = resolveElevenLabsDubFormatName(parsed?.format);
+    const ttsModel = ELEVENLABS_TTS_MODEL_ID;
 
     if (!Array.isArray(segments) || segments.length === 0) {
       sendError(res, 400, "Segments array required");
       return;
     }
 
-    if (ttsProvider === "elevenlabs") {
-      const oversizedSegment = findOversizedElevenLabsSegment(segments);
-      if (oversizedSegment) {
-        sendError(
-          res,
-          413,
-          "Segment too long",
-          `Segment ${oversizedSegment.index} has ${oversizedSegment.length} characters. ElevenLabs v3 accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment.`,
-        );
-        return;
-      }
+    const oversizedSegment = findOversizedElevenLabsSegment(segments);
+    if (oversizedSegment) {
+      sendError(
+        res,
+        413,
+        "Segment too long",
+        `Segment ${oversizedSegment.index} has ${oversizedSegment.length} characters. ElevenLabs accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment.`,
+      );
+      return;
     }
 
     // Calculate total characters for billing
@@ -779,12 +780,14 @@ async function handleDubDirect(
       service: STAGE5_RELAY_BILLING_SERVICES.TTS,
       deviceId,
       clientIdempotencyKey: idempotencyKey,
+      // Keyed on the fields exactly as the client sent them, so a client
+      // retry that straddles this deploy still maps to the same reservation.
       payload: {
         segments,
-        voice,
-        model,
-        format,
-        ttsProvider,
+        voice: parsed?.voice || "alloy",
+        model: parsed?.model || "tts-1",
+        format: parsed?.format || "mp3",
+        ttsProvider: parsed?.ttsProvider || "openai",
       },
     });
     pruneDirectDubbingReplayCache();
@@ -846,7 +849,7 @@ async function handleDubDirect(
           requestKey,
           service: STAGE5_RELAY_BILLING_SERVICES.TTS,
           characters: totalCharacters,
-          model: ttsProvider === "elevenlabs" ? ELEVENLABS_TTS_MODEL_ID : model,
+          model: ttsModel,
           meta: {
             directRequestLease,
           },
@@ -985,7 +988,7 @@ async function handleDubDirect(
 
     const dubLogPrefix = `[dub ${shortDubRequestKey(requestKey)}]`;
     console.log(
-      `${dubLogPrefix} 🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ${ttsProvider}, concurrency=${DUB_SEGMENT_CONCURRENCY}, stream=${wantsDubStream}...`,
+      `${dubLogPrefix} 🎧 Synthesizing ${segments.length} segments (${totalCharacters} chars) with ElevenLabs ${ttsModel} voice=${voice} format=${format}, concurrency=${DUB_SEGMENT_CONCURRENCY}, stream=${wantsDubStream}...`,
     );
 
     if (wantsDubStream) {
@@ -996,118 +999,51 @@ async function handleDubDirect(
     };
 
     let result: any;
-    let ttsModel = model;
 
     try {
-      if (ttsProvider === "elevenlabs") {
-        // Use ElevenLabs
-        const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
-        if (!elevenLabsKey) {
-          await releaseRelayCredits({
-            cfApiBase: CF_API_BASE,
-            relaySecret: RELAY_SECRET,
-            payload: {
-              deviceId,
-              requestKey,
-              service: STAGE5_RELAY_BILLING_SERVICES.TTS,
-            },
-          });
-          sendReplayError(500, "ElevenLabs not configured");
-          return;
-        }
-
-        ttsModel = ELEVENLABS_TTS_MODEL_ID;
-        throwIfRequestAborted();
-        const pool = await synthesizeDubSegmentsWithPool({
-          jobs: buildDubSegmentJobs(segments),
-          logPrefix: dubLogPrefix,
-          parentSignal: requestAbortController.signal,
-          isAborted: isRequestAborted,
-          timeoutMs: DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS,
-          shouldRetry: shouldRetrySegmentError,
-          synthesize: (job, signal) =>
-            synthesizeWithElevenLabs({
-              text: job.text,
-              voice,
-              modelId: ELEVENLABS_TTS_MODEL_ID,
-              format,
-              apiKey: elevenLabsKey,
-              signal,
-            }),
-          onProgress: reportDubProgress,
-        });
-        logDubPoolSummary(dubLogPrefix, pool, totalCharacters);
-
-        result = {
-          segments: pool.segments,
-          format,
-          voice,
-          model: ttsModel,
-          segmentCount: pool.segments.length,
-        };
-      } else {
-        // Use OpenAI TTS
-        console.log("   >>> Entering OpenAI TTS branch");
-        const openaiKey = process.env.OPENAI_API_KEY;
-        console.log("   >>> OpenAI key exists:", !!openaiKey);
-        if (!openaiKey) {
-          await releaseRelayCredits({
-            cfApiBase: CF_API_BASE,
-            relaySecret: RELAY_SECRET,
-            payload: {
-              deviceId,
-              requestKey,
-              service: STAGE5_RELAY_BILLING_SERVICES.TTS,
-            },
-          });
-          sendReplayError(500, "OpenAI not configured");
-          return;
-        }
-
-        const client = makeOpenAI(openaiKey);
-        throwIfRequestAborted();
-        console.log(
-          `${dubLogPrefix} OpenAI TTS voice=${voice} model=${model} format=${format} timeout=${DUB_OPENAI_SEGMENT_TIMEOUT_MS}ms`,
-        );
-        const pool = await synthesizeDubSegmentsWithPool({
-          jobs: buildDubSegmentJobs(segments),
-          logPrefix: dubLogPrefix,
-          parentSignal: requestAbortController.signal,
-          isAborted: isRequestAborted,
-          timeoutMs: DUB_OPENAI_SEGMENT_TIMEOUT_MS,
-          shouldRetry: shouldRetrySegmentError,
-          synthesize: async (job, signal) => {
-            const ttsRes = await client.audio.speech.create(
-              {
-                model,
-                voice: voice as any,
-                input: job.text,
-                response_format: format as any,
-              },
-              // Per-request timeout + no SDK-internal retries: the pool owns
-              // retry/backoff so attempts are visible in logs. Without this,
-              // the client default (600s timeout x 3 retries) lets one stalled
-              // vendor call freeze the whole dub for many minutes.
-              {
-                signal,
-                timeout: DUB_OPENAI_SEGMENT_TIMEOUT_MS,
-                maxRetries: 0,
-              },
-            );
-            return Buffer.from(await ttsRes.arrayBuffer());
+      const elevenLabsKey = process.env.ELEVENLABS_API_KEY;
+      if (!elevenLabsKey) {
+        await releaseRelayCredits({
+          cfApiBase: CF_API_BASE,
+          relaySecret: RELAY_SECRET,
+          payload: {
+            deviceId,
+            requestKey,
+            service: STAGE5_RELAY_BILLING_SERVICES.TTS,
           },
-          onProgress: reportDubProgress,
         });
-        logDubPoolSummary(dubLogPrefix, pool, totalCharacters);
-
-        result = {
-          segments: pool.segments,
-          format,
-          voice,
-          model,
-          segmentCount: pool.segments.length,
-        };
+        sendReplayError(500, "ElevenLabs not configured");
+        return;
       }
+
+      throwIfRequestAborted();
+      const pool = await synthesizeDubSegmentsWithPool({
+        jobs: buildDubSegmentJobs(segments),
+        logPrefix: dubLogPrefix,
+        parentSignal: requestAbortController.signal,
+        isAborted: isRequestAborted,
+        timeoutMs: DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS,
+        shouldRetry: shouldRetrySegmentError,
+        synthesize: (job, signal) =>
+          synthesizeWithElevenLabs({
+            text: job.text,
+            voice,
+            modelId: ttsModel,
+            format,
+            apiKey: elevenLabsKey,
+            signal,
+          }),
+        onProgress: reportDubProgress,
+      });
+      logDubPoolSummary(dubLogPrefix, pool, totalCharacters);
+
+      result = {
+        segments: pool.segments,
+        format,
+        voice,
+        model: ttsModel,
+        segmentCount: pool.segments.length,
+      };
     } catch (ttsError: any) {
       if (
         isRequestAborted() ||
@@ -1368,16 +1304,13 @@ async function handleDubElevenLabs(
         res,
         413,
         "Segment too long",
-        `Segment ${oversizedSegment.index} has ${oversizedSegment.length} characters. ElevenLabs v3 accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment.`,
+        `Segment ${oversizedSegment.index} has ${oversizedSegment.length} characters. ElevenLabs accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment.`,
       );
       return;
     }
 
-    const voice = parsed?.voice || "adam";
-    const format =
-      typeof parsed?.format === "string" && parsed.format.trim()
-        ? parsed.format.trim()
-        : "mp3";
+    const voice = resolveElevenLabsDubVoice(parsed?.voice);
+    const format = resolveElevenLabsDubFormatName(parsed?.format);
     const totalCharacters = segmentsPayload.reduce(
       (sum: number, seg: any) => sum + seg.text.length,
       0,
@@ -1432,32 +1365,36 @@ async function handleDubElevenLabs(
   }
 }
 
+/**
+ * POST /dub — stage5-api's original dubbing endpoint. It used to synthesize
+ * with OpenAI tts-1; OpenAI TTS shuts down on 2027-01-06, so it now runs on
+ * ElevenLabs v4 like every other managed dubbing path. Kept (rather than
+ * removed) so a stage5-api still on the old code keeps working during the
+ * rollout: that build sends only X-OpenAI-Key, so the relay's own
+ * ELEVENLABS_API_KEY is used when no X-ElevenLabs-Key header is present.
+ * Billing stays with stage5-api (it reserves/settles around this call).
+ */
 async function handleDub(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: RelayRoutesContext,
 ): Promise<void> {
-  console.log("🎬 Processing dub synthesis request...");
+  console.log("🎬 Processing dub synthesis request (ElevenLabs)...");
 
   const {
     CF_API_BASE,
     RELAY_SECRET,
     DUB_MAX_SEGMENTS,
     DUB_MAX_TOTAL_CHARACTERS,
-    DUB_MAX_RETRIES,
-    DUB_RETRY_BASE_DELAY_MS,
-    DUB_RETRY_MAX_DELAY_MS,
-    DUB_MAX_CONCURRENCY,
     MAX_TTS_CHARS_PER_CHUNK,
     getHeader,
     sendError,
     sendJson,
     validateRelaySecret,
     readJsonBody,
-    makeOpenAI,
+    synthesizeWithElevenLabs,
     chunkLines,
     shouldRetrySegmentError,
-    sleep,
   } = ctx;
 
   if (!validateRelaySecret(req, RELAY_SECRET)) {
@@ -1489,24 +1426,30 @@ async function handleDub(
     return;
   }
 
-  const openaiKey = getHeader(req, "x-openai-key");
-  if (!openaiKey) {
-    console.log("❌ Missing OpenAI API key for /dub");
-    sendError(res, 401, "Unauthorized - missing OpenAI key");
+  const elevenLabsKey =
+    getHeader(req, "x-elevenlabs-key") || process.env.ELEVENLABS_API_KEY;
+  if (!elevenLabsKey) {
+    console.log("❌ ElevenLabs API key not available for /dub");
+    sendError(res, 500, "ElevenLabs not configured");
     return;
   }
 
+  const requestAbortController = new AbortController();
+  const disconnectWatcher = watchClientDisconnect(req, res, () => {
+    requestAbortController.abort();
+  });
+  const isAborted = () =>
+    disconnectWatcher.isDisconnected() ||
+    requestAbortController.signal.aborted;
+
   try {
     const parsed = await readJsonBody(req);
-    const segmentsPayload = Array.isArray(parsed?.segments)
+    const segmentsPayload: DubSegmentJob[] = Array.isArray(parsed?.segments)
       ? parsed.segments
-          .map((segment: any, idx: number) => {
-            const rawText =
-              typeof segment?.text === "string" ? segment.text : "";
-            const text = rawText.trim();
-            if (!text) {
-              return null;
-            }
+          .map((segment: any, idx: number): DubSegmentJob | null => {
+            const text =
+              typeof segment?.text === "string" ? segment.text.trim() : "";
+            if (!text) return null;
             const index = Number.isFinite(segment?.index)
               ? Number(segment.index)
               : idx + 1;
@@ -1526,44 +1469,21 @@ async function handleDub(
                 : typeof start === "number" && typeof end === "number"
                   ? Math.max(0, end - start)
                   : undefined;
-            return {
-              index,
-              text,
-              start,
-              end,
-              targetDuration,
-            };
+            return { index, text, targetDuration };
           })
-          .filter(
-            (
-              seg: any,
-            ): seg is {
-              index: number;
-              text: string;
-              start?: number;
-              end?: number;
-              targetDuration?: number;
-            } => Boolean(seg),
+          .filter((seg: DubSegmentJob | null): seg is DubSegmentJob =>
+            Boolean(seg),
           )
       : [];
 
     const lines = Array.isArray(parsed?.lines)
       ? parsed.lines.map((line: any) => String(line ?? "").trim())
       : [];
-    const voice =
-      typeof parsed?.voice === "string" && parsed.voice.trim()
-        ? parsed.voice.trim()
-        : "alloy";
-    const model =
-      typeof parsed?.model === "string" && parsed.model.trim()
-        ? parsed.model.trim()
-        : "tts-1";
-    const format =
-      typeof parsed?.format === "string" && parsed.format.trim()
-        ? parsed.format.trim()
-        : "mp3";
-
-    const client = makeOpenAI(openaiKey);
+    // Old stage5-api builds send OpenAI voice/model names; the voice maps to
+    // ElevenLabs and the model is ignored (always ElevenLabs v4).
+    const voice = resolveElevenLabsDubVoice(parsed?.voice);
+    const format = resolveElevenLabsDubFormatName(parsed?.format);
+    const model = ELEVENLABS_TTS_MODEL_ID;
 
     if (segmentsPayload.length > 0) {
       if (segmentsPayload.length > DUB_MAX_SEGMENTS) {
@@ -1577,7 +1497,7 @@ async function handleDub(
       }
 
       const totalCharacters = segmentsPayload.reduce(
-        (sum: number, seg: { text: string }) => sum + seg.text.length,
+        (sum, seg) => sum + seg.text.length,
         0,
       );
 
@@ -1591,172 +1511,50 @@ async function handleDub(
         return;
       }
 
+      const oversizedSegment = findOversizedElevenLabsSegment(segmentsPayload);
+      if (oversizedSegment) {
+        sendError(
+          res,
+          413,
+          "Segment too long",
+          `Segment ${oversizedSegment.index} has ${oversizedSegment.length} characters. ElevenLabs accepts at most ${ELEVENLABS_TTS_MAX_TEXT_CHARACTERS} characters per segment.`,
+        );
+        return;
+      }
+
+      const dubLogPrefix = `[dub-legacy ${shortDubRequestKey(internalBilling.requestKey)}]`;
       console.log(
-        `🎧 Synthesizing ${segmentsPayload.length} segment(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`,
+        `${dubLogPrefix} 🎧 Synthesizing ${segmentsPayload.length} segment(s) (${totalCharacters} chars) with ElevenLabs ${model} voice=${voice} format=${format}, concurrency=${DUB_SEGMENT_CONCURRENCY}`,
       );
 
-      const segmentResponses: Array<{
-        index: number;
-        audioBase64: string;
-        targetDuration?: number;
-      }> = new Array(segmentsPayload.length);
-
-      const segmentAbortControllers = new Map<number, AbortController>();
-      const disconnectWatcher = watchClientDisconnect(req, res, () => {
-        for (const controller of segmentAbortControllers.values()) {
-          controller.abort();
-        }
+      const pool = await synthesizeDubSegmentsWithPool({
+        jobs: segmentsPayload,
+        logPrefix: dubLogPrefix,
+        parentSignal: requestAbortController.signal,
+        isAborted,
+        timeoutMs: DUB_ELEVENLABS_SEGMENT_TIMEOUT_MS,
+        shouldRetry: shouldRetrySegmentError,
+        synthesize: (job, signal) =>
+          synthesizeWithElevenLabs({
+            text: job.text,
+            voice,
+            modelId: model,
+            format,
+            apiKey: elevenLabsKey,
+            signal,
+          }),
       });
-      try {
-        const synthesizeSegment = async (segIdx: number) => {
-          const seg = segmentsPayload[segIdx];
-          let attempt = 0;
-          const abortController = new AbortController();
-          segmentAbortControllers.set(segIdx, abortController);
+      logDubPoolSummary(dubLogPrefix, pool, totalCharacters);
 
-          try {
-            while (attempt < DUB_MAX_RETRIES) {
-              if (disconnectWatcher.isDisconnected()) {
-                throw new Error("Client disconnected");
-              }
-
-              attempt += 1;
-              try {
-                const speech = await client.audio.speech.create(
-                  {
-                    model,
-                    voice,
-                    input: seg.text,
-                    response_format: format,
-                  },
-                  // Outer retry loop owns retries; bound each attempt so a
-                  // stalled vendor call cannot hold a worker for the SDK
-                  // default 600s.
-                  {
-                    signal: abortController.signal,
-                    timeout: DUB_OPENAI_SEGMENT_TIMEOUT_MS,
-                    maxRetries: 0,
-                  },
-                );
-                const arrayBuffer = await speech.arrayBuffer();
-                segmentResponses[segIdx] = {
-                  index: seg.index,
-                  audioBase64: Buffer.from(arrayBuffer).toString("base64"),
-                  targetDuration: seg.targetDuration,
-                };
-                return;
-              } catch (segmentError: any) {
-                if (
-                  disconnectWatcher.isDisconnected() ||
-                  abortController.signal.aborted
-                ) {
-                  throw segmentError;
-                }
-
-                if (
-                  attempt >= DUB_MAX_RETRIES ||
-                  !shouldRetrySegmentError(segmentError)
-                ) {
-                  throw segmentError;
-                }
-
-                const delay = Math.min(
-                  DUB_RETRY_MAX_DELAY_MS,
-                  DUB_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1),
-                );
-                console.warn(
-                  `⚠️ Segment ${segIdx + 1}/${segmentsPayload.length} retry ${attempt}/${DUB_MAX_RETRIES} in ${delay}ms:`,
-                  segmentError?.message || segmentError,
-                );
-                await sleep(delay);
-              }
-            }
-
-            throw new Error(
-              `Segment ${segIdx + 1} exhausted retries without completion`,
-            );
-          } finally {
-            segmentAbortControllers.delete(segIdx);
-          }
-        };
-
-        // Use a queue to distribute work safely across workers
-        const pendingIndices = segmentsPayload.map((_: any, i: number) => i);
-        const workerCount = Math.min(
-          DUB_MAX_CONCURRENCY,
-          segmentsPayload.length,
-        );
-        const claimNextPendingIndex = (): number | undefined => {
-          if (disconnectWatcher.isDisconnected()) {
-            return undefined;
-          }
-          return pendingIndices.shift();
-        };
-
-        const workers = Array.from(
-          { length: workerCount },
-          async (_, workerIdx) => {
-            for (
-              let current = claimNextPendingIndex();
-              current !== undefined;
-              current = claimNextPendingIndex()
-            ) {
-              const seg = segmentsPayload[current];
-              console.log(
-                `   • Worker ${workerIdx + 1}/${workerCount} segment ${
-                  current + 1
-                }/${segmentsPayload.length} (index=${seg.index}, ${seg.text.length} chars)`,
-              );
-              await synthesizeSegment(current);
-              console.log(
-                `     · Completed segment ${current + 1}/${segmentsPayload.length}`,
-              );
-            }
-          },
-        );
-
-        try {
-          await Promise.all(workers);
-        } catch (segmentError: any) {
-          if (disconnectWatcher.isDisconnected()) {
-            console.warn(
-              "⚠️ Dub request aborted by upstream client while synthesizing segments",
-            );
-            return;
-          }
-
-          const details = segmentError?.response?.data ?? segmentError?.message;
-          console.error("❌ Relay segment synthesis failed:", details);
-          sendError(
-            res,
-            500,
-            "Dub synthesis failed",
-            typeof details === "string" ? details : JSON.stringify(details),
-          );
-          return;
-        }
-
-        if (disconnectWatcher.isDisconnected()) {
-          console.warn(
-            "⚠️ Dub request closed before completion; skipping response",
-          );
-          return;
-        }
-
-        const completedSegments = segmentResponses.filter(Boolean);
-
-        sendJson(res, {
-          voice,
-          model,
-          format,
-          segmentCount: completedSegments.length,
-          totalCharacters,
-          segments: completedSegments,
-        });
-        return;
-      } finally {
-        disconnectWatcher.cleanup();
-      }
+      sendJson(res, {
+        voice,
+        model,
+        format,
+        segmentCount: pool.segments.length,
+        totalCharacters,
+        segments: pool.segments,
+      });
+      return;
     }
 
     if (!lines.length) {
@@ -1768,6 +1566,7 @@ async function handleDub(
       (sum: number, line: string) => sum + line.length,
       0,
     );
+    // MAX_TTS_CHARS_PER_CHUNK (3,500) is below ElevenLabs' 5,000-char limit.
     const chunks = chunkLines(lines, MAX_TTS_CHARS_PER_CHUNK);
 
     if (!chunks.length) {
@@ -1776,35 +1575,41 @@ async function handleDub(
     }
 
     console.log(
-      `🎧 Synthesizing ${chunks.length} chunk(s) (${totalCharacters} chars) model=${model} voice=${voice} format=${format}`,
+      `🎧 Synthesizing ${chunks.length} chunk(s) (${totalCharacters} chars) with ElevenLabs ${model} voice=${voice} format=${format}`,
     );
 
     const chunkBuffers: Buffer[] = [];
-
     for (let idx = 0; idx < chunks.length; idx++) {
+      if (isAborted()) {
+        console.warn("⚠️ /dub aborted by upstream client");
+        return;
+      }
       const chunk = chunks[idx];
       console.log(
         `   • Chunk ${idx + 1}/${chunks.length} (${chunk.length} chars)`,
       );
-      const speech = await client.audio.speech.create(
-        {
-          model,
-          voice,
-          input: chunk,
-          response_format: format,
-        },
-        // SDK-level retries (client default 3) still apply on this path.
-        { timeout: DUB_CHUNK_TIMEOUT_MS },
+      const audio = await withSegmentTimeout(
+        requestAbortController.signal,
+        DUB_CHUNK_TIMEOUT_MS,
+        (signal) =>
+          synthesizeWithElevenLabs({
+            text: chunk,
+            voice,
+            modelId: model,
+            format,
+            apiKey: elevenLabsKey,
+            signal,
+          }),
       );
-      const arrayBuffer = await speech.arrayBuffer();
-      chunkBuffers.push(Buffer.from(arrayBuffer));
+      // Each chunk is a complete MP3 file; an ID3 tag in the middle of the
+      // joined stream decodes as a broken packet, so keep only the first.
+      chunkBuffers.push(
+        idx > 0 && format === "mp3" ? stripLeadingId3Tags(audio) : audio,
+      );
     }
 
-    const combined = Buffer.concat(chunkBuffers);
-    const audioBase64 = combined.toString("base64");
-
     sendJson(res, {
-      audioBase64,
+      audioBase64: Buffer.concat(chunkBuffers).toString("base64"),
       voice,
       model,
       format,
@@ -1812,6 +1617,14 @@ async function handleDub(
       totalCharacters,
     });
   } catch (error: any) {
+    if (
+      isAborted() ||
+      error?.name === "AbortError" ||
+      String(error?.message || "").includes("Client disconnected")
+    ) {
+      console.warn("⚠️ /dub aborted by upstream client");
+      return;
+    }
     console.error("❌ Relay dub synthesis error:", error?.message || error);
     sendError(
       res,
@@ -1819,5 +1632,7 @@ async function handleDub(
       "Dub synthesis failed",
       error?.message || String(error),
     );
+  } finally {
+    disconnectWatcher.cleanup();
   }
 }

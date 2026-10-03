@@ -1,5 +1,9 @@
 import { Buffer } from "node:buffer";
 import { synthesizeElevenV4 } from "./elevenlabs-dialogue.js";
+import {
+  ELEVENLABS_DEFAULT_DUB_VOICE,
+  resolveElevenLabsVoiceId,
+} from "./elevenlabs-voices.js";
 import * as fs from "node:fs/promises";
 
 const ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1";
@@ -342,7 +346,7 @@ function wrapPcm16LeAsWav(
  */
 export async function synthesizeWithElevenLabs({
   text,
-  voice = "adam",
+  voice = ELEVENLABS_DEFAULT_DUB_VOICE,
   modelId = ELEVENLABS_TTS_MODEL_ID,
   format = "mp3",
   apiKey,
@@ -357,33 +361,9 @@ export async function synthesizeWithElevenLabs({
 }): Promise<Buffer> {
   assertElevenLabsTtsTextLength(text);
 
-  // ElevenLabs voice IDs - map common names to IDs
-  const voiceIdMap: Record<string, string> = {
-    adam: "pNInz6obpgDQGcFmaJgB",
-    rachel: "21m00Tcm4TlvDq8ikWAM",
-    domi: "AZnzlk1XvdvUeBnXmlld",
-    bella: "EXAVITQu4vr4xnSDxMaL",
-    antoni: "ErXwobaYiN019PkySvjV",
-    elli: "MF3mGyEYCl7XYWbV9V6O",
-    josh: "TxGEqnHWrfWFTfGW9XjX",
-    arnold: "VR6AewLTigWG4xSOukaG",
-    sam: "yoZ06aMxZJJ28mfd3POQ",
-    // Additional ElevenLabs voices
-    sarah: "EXAVITQu4vr4xnSDxMaL", // American, young, soft (same as bella)
-    charlie: "IKne3meq5aSn9XLyUdCD", // Australian, middle-aged, casual
-    emily: "LcfcDJNUP1GQjkzn1xUU", // American, young, calm
-    matilda: "XrExE9yKIg1WjnnlVkGX", // American, middle-aged, warm
-    brian: "nPczCjzI2devNBz1zQrb", // American, middle-aged, deep
-    // OpenAI voice name mappings for compatibility
-    alloy: "pNInz6obpgDQGcFmaJgB", // map to adam
-    echo: "VR6AewLTigWG4xSOukaG", // map to arnold
-    fable: "MF3mGyEYCl7XYWbV9V6O", // map to elli
-    onyx: "TxGEqnHWrfWFTfGW9XjX", // map to josh
-    nova: "21m00Tcm4TlvDq8ikWAM", // map to rachel
-    shimmer: "EXAVITQu4vr4xnSDxMaL", // map to bella
-  };
-
-  const voiceId = voiceIdMap[voice.toLowerCase()] || voice;
+  // Voice names (including legacy OpenAI names from older Translator builds)
+  // resolve through the shared map in elevenlabs-voices.ts.
+  const voiceId = resolveElevenLabsVoiceId(voice);
 
   const outputSpec = resolveElevenLabsDubFormat(format);
   if (modelId === 'eleven_v4') {
