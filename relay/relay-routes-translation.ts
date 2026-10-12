@@ -453,9 +453,16 @@ async function handleTranslateDirect(
       sendError(res, 400, "tools cannot be combined with webSearch");
       return;
     }
+    const promptTokenReserve = estimateTranslationPromptTokenReserve({
+      model,
+      messages,
+      tools,
+    });
     const maxCompletionTokens = resolveTranslationReservationMaxCompletionTokens({
       model,
       reasoning,
+      promptTokens: promptTokenReserve,
+      usesToolsOrWebSearch: Boolean(tools) || useWebSearch,
     });
 
     if (!isAllowedStage5TranslationModel(model)) {
@@ -526,11 +533,6 @@ async function handleTranslateDirect(
       });
       sendDirectTranslationReplay(res, replay, sendError, sendJson);
     };
-    const promptTokenReserve = estimateTranslationPromptTokenReserve({
-      model,
-      messages,
-      tools,
-    });
     const directRequestLease = createDirectRequestLease();
     let reserveResult: Awaited<ReturnType<typeof reserveRelayCredits>> | null = null;
     for (let orphanRecoveryAttempt = 0; orphanRecoveryAttempt < 2; orphanRecoveryAttempt += 1) {
@@ -833,8 +835,15 @@ async function handleTranslateDirect(
           });
 
     console.log(
-      `🎯 Translation complete! Tokens: ${promptTokens}+${completionTokens}`,
+      `🎯 Translation complete! Tokens: ${promptTokens}+${completionTokens} (cap ${maxCompletionTokens})`,
     );
+    if (completionTokens >= maxCompletionTokens * 0.8) {
+      // The prompt-sized output cap is nearly exhausted: output may have been
+      // cut short. Never seen in production data; surface it if it happens.
+      console.warn(
+        `⚠️ Translation output near its cap: ${completionTokens}/${maxCompletionTokens} (model=${model}, prompt=${promptTokens})`,
+      );
+    }
 
     const replaySuccess: DirectTranslationReplayResult = {
       kind: "success",

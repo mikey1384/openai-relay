@@ -151,19 +151,48 @@ export function resolveTranslationModel({
   return selectedModel;
 }
 
+// Output allowance for a plain translation part, sized from its prompt. Over
+// 11,394 settled production parts (2026-06..10) output never exceeded 0.75x
+// the prompt (largest 2,161 tokens), so 2x + 1,024 leaves >2.6x headroom. The
+// returned value both sizes the credit hold and caps the provider call, so
+// actual spend still can never exceed the hold. A flat 16,000 held ~40x the
+// real cost per part, and parallel parts then starved each other on modest
+// balances: users who could afford the job were refused (2026-10-12).
+export const TRANSLATION_OUTPUT_TOKENS_PER_PROMPT_TOKEN = 2;
+export const TRANSLATION_OUTPUT_BASE_TOKENS = 1_024;
+
 export function resolveTranslationReservationMaxCompletionTokens({
   model,
   reasoning,
+  promptTokens,
+  usesToolsOrWebSearch = false,
 }: {
   model: string;
   reasoning?: { effort?: "low" | "medium" | "high" | "xhigh" } | null;
+  promptTokens?: number;
+  usesToolsOrWebSearch?: boolean;
 }): number {
   const effort = String(reasoning?.effort || "").trim().toLowerCase();
-  if (
-    isClaudeModel(model) &&
-    (effort === "medium" || effort === "high" || effort === "xhigh")
-  ) {
+  const deepReasoning =
+    effort === "medium" || effort === "high" || effort === "xhigh";
+  if (isClaudeModel(model) && deepReasoning) {
     return EXTENDED_TRANSLATION_MAX_COMPLETION_TOKENS;
   }
-  return DEFAULT_TRANSLATION_MAX_COMPLETION_TOKENS;
+  // Reasoning, tool calls and web search can legitimately produce output
+  // unrelated to prompt size (and Claude thinking raises its own limit), so
+  // they keep the flat cap. Callers without a prompt estimate do too.
+  if (
+    deepReasoning ||
+    usesToolsOrWebSearch ||
+    typeof promptTokens !== "number" ||
+    !Number.isFinite(promptTokens) ||
+    promptTokens <= 0
+  ) {
+    return DEFAULT_TRANSLATION_MAX_COMPLETION_TOKENS;
+  }
+  return Math.min(
+    DEFAULT_TRANSLATION_MAX_COMPLETION_TOKENS,
+    Math.ceil(promptTokens * TRANSLATION_OUTPUT_TOKENS_PER_PROMPT_TOKEN) +
+      TRANSLATION_OUTPUT_BASE_TOKENS,
+  );
 }

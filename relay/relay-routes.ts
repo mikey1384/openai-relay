@@ -180,6 +180,8 @@ export interface RelayRoutesContext {
   resolveTranslationReservationMaxCompletionTokens: (params: {
     model: string;
     reasoning?: { effort?: "low" | "medium" | "high" | "xhigh" } | null;
+    promptTokens?: number;
+    usesToolsOrWebSearch?: boolean;
   }) => number;
   isAllowedStage5TranslationModel: (model: string) => boolean;
   isClaudeModel: (model: string) => boolean;
