@@ -378,6 +378,7 @@ async function handleTranslateDirect(
     resolveTranslationReservationMaxCompletionTokens,
     isAllowedStage5TranslationModel,
     isClaudeModel,
+    normalizeModelId,
     translateWithClaude,
     translateWithClaudeWebSearch,
     translateWithOpenAiWebSearch,
@@ -433,17 +434,35 @@ async function handleTranslateDirect(
     const modelFamily = parseTranslationModelFamily(parsed?.modelFamily);
     const qualityMode =
       typeof parsed?.qualityMode === "boolean" ? parsed.qualityMode : undefined;
-    const model = resolveTranslationModel({
-      rawModel:
-        typeof parsed?.model === "string" && parsed.model.trim()
-          ? parsed.model.trim()
-          : DEFAULT_TRANSLATION_MODEL,
-      messages: Array.isArray(messages) ? messages : undefined,
-      canUseAnthropic: Boolean(process.env.ANTHROPIC_API_KEY),
-      modelFamily,
-      translationPhase,
-      qualityMode,
-    });
+    // Internal devices only: pick any allowed model to measure it on real
+    // traffic before it becomes a default. Everyone else gets the server's
+    // model choice; the field is ignored for them.
+    const requestedOverride =
+      typeof parsed?.internalModelOverride === "string"
+        ? parsed.internalModelOverride.trim()
+        : "";
+    const internalModelOverride =
+      authResult.internal &&
+      requestedOverride &&
+      isAllowedStage5TranslationModel(requestedOverride)
+        ? normalizeModelId(requestedOverride)
+        : null;
+    const model =
+      internalModelOverride ??
+      resolveTranslationModel({
+        rawModel:
+          typeof parsed?.model === "string" && parsed.model.trim()
+            ? parsed.model.trim()
+            : DEFAULT_TRANSLATION_MODEL,
+        messages: Array.isArray(messages) ? messages : undefined,
+        canUseAnthropic: Boolean(process.env.ANTHROPIC_API_KEY),
+        modelFamily,
+        translationPhase,
+        qualityMode,
+      });
+    if (internalModelOverride) {
+      console.log(`🧪 Internal device model override: ${internalModelOverride}`);
+    }
     const reasoning = translationPhase === "review" ? undefined : parsed?.reasoning;
     const useWebSearch = parseBooleanLike(parsed?.webSearch) === true;
     const tools = parseChatTools(parsed?.tools);

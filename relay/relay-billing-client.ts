@@ -14,6 +14,8 @@ type RelayAuthorizeSuccess = {
   ok: true;
   deviceId: string;
   creditBalance: number;
+  // Stage5's own devices (stage5-api internal_devices); gates trial controls.
+  internal: boolean;
 };
 
 type RelayMutationSuccess = {
@@ -250,6 +252,7 @@ export async function authorizeRelayDevice({
     ok: true,
     deviceId,
     creditBalance: Number.isFinite(creditBalance) ? creditBalance : 0,
+    internal: (payload as any)?.internal === true,
   };
 }
 
