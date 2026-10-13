@@ -10,6 +10,7 @@ export const STAGE5_CLAUDE_OPUS_MODEL = "claude-opus-4-8";
 // defaults (Sonnet 5.5 for drafts, Opus 5.5 for review and summaries).
 export const STAGE5_CLAUDE_SONNET_5_5_MODEL = "claude-sonnet-5-5";
 export const STAGE5_CLAUDE_OPUS_5_5_MODEL = "claude-opus-5-5";
+export const STAGE5_CLAUDE_HAIKU_5_5_MODEL = "claude-haiku-5-5";
 
 export const STAGE5_TRANSLATION_MODEL_ALIASES = {
   // Legacy GPT-5.4 values from older clients normalize to current GPT review.
@@ -34,6 +35,7 @@ export const STAGE5_ALLOWED_TRANSLATION_MODELS = [
   STAGE5_CLAUDE_OPUS_MODEL,
   STAGE5_CLAUDE_SONNET_5_5_MODEL,
   STAGE5_CLAUDE_OPUS_5_5_MODEL,
+  STAGE5_CLAUDE_HAIKU_5_5_MODEL,
 ] as const;
 
 const STAGE5_ALLOWED_TRANSLATION_MODEL_SET = new Set<string>(

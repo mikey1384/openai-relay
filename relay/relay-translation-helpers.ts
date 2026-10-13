@@ -1,6 +1,6 @@
 import { claudeModelAlwaysThinks } from "../anthropic-config.js";
+import { STAGE5_CLAUDE_OPUS_5_5_MODEL } from "../model-catalog.js";
 import {
-  CLAUDE_OPUS_MODEL,
   DEFAULT_TRANSLATION_MODEL,
   isClaudeModel,
   normalizeModelId,
@@ -128,14 +128,15 @@ export function resolveTranslationModel({
             ? "review"
             : "draft";
 
-  const prefersClaudeReview =
-    canUseAnthropic &&
-    (modelFamily === "claude" || isClaudeModel(normalized));
-
+  // Credit-mode review uses Anthropic's current Opus at the comparable price
+  // tier: on the 2026-10-13 trial Opus 5.5 cost about half of GPT-5.5 and was
+  // more complete and consistent. GPT-5.5 remains only the fallback when
+  // Anthropic is unavailable; GPT choices belong to API-key users, whose
+  // requests don't come through Stage5.
   const selectedModel =
     effectivePhase === "review"
-      ? prefersClaudeReview
-        ? CLAUDE_OPUS_MODEL
+      ? canUseAnthropic
+        ? STAGE5_CLAUDE_OPUS_5_5_MODEL
         : STAGE5_REVIEW_MODEL
       : DEFAULT_TRANSLATION_MODEL;
 
@@ -161,6 +162,7 @@ export function resolveTranslationModel({
 // balances: users who could afford the job were refused (2026-10-12).
 export const TRANSLATION_OUTPUT_TOKENS_PER_PROMPT_TOKEN = 2;
 export const TRANSLATION_OUTPUT_BASE_TOKENS = 1_024;
+export const ALWAYS_THINKING_OUTPUT_BASE_TOKENS = 4_096;
 
 export function resolveTranslationReservationMaxCompletionTokens({
   model,
@@ -176,9 +178,7 @@ export function resolveTranslationReservationMaxCompletionTokens({
   const effort = String(reasoning?.effort || "").trim().toLowerCase();
   const deepReasoning =
     effort === "medium" || effort === "high" || effort === "xhigh";
-  // Models that always think (Opus 5.5) need room for reasoning tokens until
-  // measured production data sizes a tighter cap.
-  if (isClaudeModel(model) && (deepReasoning || claudeModelAlwaysThinks(model))) {
+  if (isClaudeModel(model) && deepReasoning) {
     return EXTENDED_TRANSLATION_MAX_COMPLETION_TOKENS;
   }
   // Reasoning, tool calls and web search can legitimately produce output
@@ -192,6 +192,16 @@ export function resolveTranslationReservationMaxCompletionTokens({
     promptTokens <= 0
   ) {
     return DEFAULT_TRANSLATION_MAX_COMPLETION_TOKENS;
+  }
+  if (isClaudeModel(model) && claudeModelAlwaysThinks(model)) {
+    // Opus 5.5 thinks on every call (at our explicit low effort). On the
+    // 2026-10-13 trial its output including thinking peaked at 0.38x the
+    // prompt (largest 1,321 tokens), so 2x + 4,096 leaves ~7x headroom.
+    return Math.min(
+      EXTENDED_TRANSLATION_MAX_COMPLETION_TOKENS,
+      Math.ceil(promptTokens * TRANSLATION_OUTPUT_TOKENS_PER_PROMPT_TOKEN) +
+        ALWAYS_THINKING_OUTPUT_BASE_TOKENS,
+    );
   }
   return Math.min(
     DEFAULT_TRANSLATION_MAX_COMPLETION_TOKENS,

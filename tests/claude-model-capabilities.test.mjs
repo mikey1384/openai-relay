@@ -145,8 +145,32 @@ test('refusals and truncated output are errors, so holds are released unbilled',
   assert.equal(ok.choices[0].message.content, 'ok');
 });
 
-test('the output cap gives always-thinking models full room', () => {
+test('the output cap leaves always-thinking models room sized from trial data', () => {
   const { resolveTranslationReservationMaxCompletionTokens: cap, EXTENDED_TRANSLATION_MAX_COMPLETION_TOKENS: EXTENDED } = helpers;
-  assert.equal(cap({ model: 'claude-opus-5-5', promptTokens: 900 }), EXTENDED);
+  // Trial peak for Opus 5.5 incl. thinking: 0.38x the prompt, 1,321 tokens.
+  assert.equal(cap({ model: 'claude-opus-5-5', promptTokens: 900 }), 2 * 900 + 4096);
+  assert(cap({ model: 'claude-opus-5-5', promptTokens: 5019 }) > 5019 * 0.38 * 5);
+  assert.equal(cap({ model: 'claude-opus-5-5', promptTokens: 100_000 }), EXTENDED);
+  assert.equal(cap({ model: 'claude-opus-5-5', promptTokens: 900, reasoning: { effort: 'high' } }), EXTENDED);
   assert.equal(cap({ model: 'claude-sonnet-5-5', promptTokens: 900 }), 2 * 900 + 1024);
+  assert.equal(cap({ model: 'claude-haiku-5-5', promptTokens: 900 }), 2 * 900 + 1024);
+});
+
+test('Haiku 5.5 turns thinking off explicitly and keeps forced tool use', async () => {
+  const params = {};
+  const c = cfg.resolveClaudeThinkingConfig({ model: 'claude-haiku-5-5', maxTokens: 3000 });
+  c.apply(params);
+  assert.equal(c.thinkingOn, false);
+  assert.deepEqual(params.thinking, { type: 'disabled' });
+  const requests = stubAnthropic({ content: [{ type: 'tool_use', id: 't1', name: 'submit', input: {} }], stop_reason: 'tool_use' });
+  await cfg.translateWithClaude({ messages: msgs, model: 'claude-haiku-5-5', apiKey: 'k', tools: [tool], toolChoice: 'required' });
+  assert.deepEqual(requests[0].tool_choice, { type: 'any' });
+});
+
+test('credit-mode review uses Opus 5.5 when Anthropic is available, GPT-5.5 otherwise', () => {
+  const review = { translationPhase: 'review', messages: [{ role: 'user', content: 'x' }] };
+  assert.equal(helpers.resolveTranslationModel({ ...review, canUseAnthropic: true, modelFamily: 'gpt' }), 'claude-opus-5-5');
+  assert.equal(helpers.resolveTranslationModel({ ...review, canUseAnthropic: true }), 'claude-opus-5-5');
+  assert.equal(helpers.resolveTranslationModel({ ...review, canUseAnthropic: false, modelFamily: 'claude' }), 'gpt-5.5');
+  assert.equal(helpers.resolveTranslationModel({ translationPhase: 'draft', messages: [], canUseAnthropic: true }), 'gpt-5.1');
 });

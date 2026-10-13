@@ -173,6 +173,9 @@ const THINKING_BUDGET: Record<"low" | "medium" | "high", number> = {
  *   budget_tokens are 400s); effort is the only control (Opus 5.5).
  * - "between-tools-off": `disabled` is a 400; off is {type:"between_tools"},
  *   adaptive on request (Sonnet 5.5).
+ * - "disabled-off": thinking runs unless turned off with {type:"disabled"}
+ *   (valid at effort high or below, the default), adaptive on request
+ *   (Haiku 5.5).
  * forcedToolChoice=false: tool_choice any/tool is a 400; use auto plus an
  * instruction and verify a tool was called.
  */
@@ -180,7 +183,8 @@ export type ClaudeThinkingMode =
   | "budget"
   | "adaptive-optional"
   | "adaptive-always"
-  | "between-tools-off";
+  | "between-tools-off"
+  | "disabled-off";
 
 export interface ClaudeModelCapabilities {
   thinking: ClaudeThinkingMode;
@@ -214,6 +218,11 @@ const CLAUDE_MODEL_CAPABILITIES: Record<string, ClaudeModelCapabilities> = {
     thinking: "between-tools-off",
     forcedToolChoice: false,
     webSearchTool: "web_search_20260209",
+  },
+  "claude-haiku-5-5": {
+    thinking: "disabled-off",
+    forcedToolChoice: true,
+    webSearchTool: "web_search_20250305",
   },
 };
 
@@ -264,6 +273,30 @@ export function resolveClaudeThinkingConfig({
         };
       },
       logMessage: `[anthropic-config] Adaptive thinking (always on) with effort: ${resolvedEffort}`,
+    };
+  }
+
+  if (mode === "disabled-off") {
+    if (wantsThinking && !forceToolUse) {
+      return {
+        thinkingOn: true,
+        maxTokens: Math.max(maxTokens, MAX_TOKENS_WITH_THINKING),
+        apply: (requestParams) => {
+          requestParams.thinking = { type: "adaptive" };
+          requestParams.output_config = {
+            ...(requestParams.output_config || {}),
+            effort,
+          };
+        },
+        logMessage: `[anthropic-config] Adaptive thinking enabled with effort: ${effort}`,
+      };
+    }
+    return {
+      thinkingOn: false,
+      maxTokens,
+      apply: (requestParams) => {
+        requestParams.thinking = { type: "disabled" };
+      },
     };
   }
 
