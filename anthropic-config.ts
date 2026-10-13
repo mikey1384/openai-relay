@@ -154,50 +154,152 @@ function extractAnthropicToolCalls(
   return toolCalls;
 }
 
-type ClaudeEffort = "low" | "medium" | "high" | "xhigh";
+export type ClaudeEffort = "low" | "medium" | "high" | "xhigh";
 
 // Legacy extended thinking budget tokens for Claude models that still support
-// budget_tokens. Claude Opus 4.8 uses adaptive thinking instead.
+// budget_tokens.
 const THINKING_BUDGET: Record<"low" | "medium" | "high", number> = {
   low: 0, // No extended thinking
   medium: 8000, // Moderate reasoning
   high: 16000, // Deep reasoning
 };
 
-const CLAUDE_OPUS_4_8_MODEL = "claude-opus-4-8";
-const CLAUDE_SONNET_5_MODEL = "claude-sonnet-5";
+/**
+ * How each Claude model takes thinking and tool settings. Stated once per
+ * model so new IDs never fall into an older model's request shape:
+ * - "budget": thinking via budget_tokens; off by omitting `thinking`.
+ * - "adaptive-optional": adaptive thinking on request; off by omission.
+ * - "adaptive-always": thinking can't be disabled (`disabled` and
+ *   budget_tokens are 400s); effort is the only control (Opus 5.5).
+ * - "between-tools-off": `disabled` is a 400; off is {type:"between_tools"},
+ *   adaptive on request (Sonnet 5.5).
+ * forcedToolChoice=false: tool_choice any/tool is a 400; use auto plus an
+ * instruction and verify a tool was called.
+ */
+export type ClaudeThinkingMode =
+  | "budget"
+  | "adaptive-optional"
+  | "adaptive-always"
+  | "between-tools-off";
 
-// Claude 4.8+/5-family models use adaptive thinking; older models still
-// take explicit budget_tokens.
-function usesAdaptiveThinking(model: string): boolean {
-  return model === CLAUDE_OPUS_4_8_MODEL || model === CLAUDE_SONNET_5_MODEL;
+export interface ClaudeModelCapabilities {
+  thinking: ClaudeThinkingMode;
+  forcedToolChoice: boolean;
+  webSearchTool: "web_search_20250305" | "web_search_20260209";
 }
 
-type ClaudeThinkingConfig =
-  | { enabled: false; maxTokens: number }
-  | {
-      enabled: true;
-      maxTokens: number;
-      apply: (requestParams: any) => void;
-      logMessage: string;
-    };
+const LEGACY_CLAUDE_CAPABILITIES: ClaudeModelCapabilities = {
+  thinking: "budget",
+  forcedToolChoice: true,
+  webSearchTool: "web_search_20250305",
+};
 
-function resolveClaudeThinkingConfig({
+const CLAUDE_MODEL_CAPABILITIES: Record<string, ClaudeModelCapabilities> = {
+  "claude-opus-4-8": {
+    thinking: "adaptive-optional",
+    forcedToolChoice: true,
+    webSearchTool: "web_search_20250305",
+  },
+  "claude-sonnet-5": {
+    thinking: "adaptive-optional",
+    forcedToolChoice: true,
+    webSearchTool: "web_search_20250305",
+  },
+  "claude-opus-5-5": {
+    thinking: "adaptive-always",
+    forcedToolChoice: false,
+    webSearchTool: "web_search_20260209",
+  },
+  "claude-sonnet-5-5": {
+    thinking: "between-tools-off",
+    forcedToolChoice: false,
+    webSearchTool: "web_search_20260209",
+  },
+};
+
+export function getClaudeModelCapabilities(
+  model: string,
+): ClaudeModelCapabilities {
+  return CLAUDE_MODEL_CAPABILITIES[model] ?? LEGACY_CLAUDE_CAPABILITIES;
+}
+
+/** True when the model thinks on every request, so output limits need room. */
+export function claudeModelAlwaysThinks(model: string): boolean {
+  return getClaudeModelCapabilities(model).thinking === "adaptive-always";
+}
+
+type ClaudeThinkingConfig = {
+  // Whether reasoning tokens may be produced (affects max_tokens headroom and
+  // the legacy system-prompt fold).
+  thinkingOn: boolean;
+  maxTokens: number;
+  apply?: (requestParams: any) => void;
+  logMessage?: string;
+};
+
+export function resolveClaudeThinkingConfig({
   model,
   maxTokens,
   effort,
+  forceToolUse = false,
 }: {
   model: string;
   maxTokens: number;
   effort?: ClaudeEffort;
+  forceToolUse?: boolean;
 }): ClaudeThinkingConfig {
-  if (!effort || effort === "low") {
-    return { enabled: false, maxTokens };
+  const { thinking: mode } = getClaudeModelCapabilities(model);
+  const wantsThinking = Boolean(effort && effort !== "low");
+
+  if (mode === "adaptive-always") {
+    const resolvedEffort = effort ?? "low";
+    return {
+      thinkingOn: true,
+      maxTokens: Math.max(maxTokens, MAX_TOKENS_WITH_THINKING),
+      apply: (requestParams) => {
+        requestParams.thinking = { type: "adaptive" };
+        requestParams.output_config = {
+          ...(requestParams.output_config || {}),
+          effort: resolvedEffort,
+        };
+      },
+      logMessage: `[anthropic-config] Adaptive thinking (always on) with effort: ${resolvedEffort}`,
+    };
   }
 
-  if (usesAdaptiveThinking(model)) {
+  if (mode === "between-tools-off") {
+    if (wantsThinking && !forceToolUse) {
+      return {
+        thinkingOn: true,
+        maxTokens: Math.max(maxTokens, MAX_TOKENS_WITH_THINKING),
+        apply: (requestParams) => {
+          requestParams.thinking = { type: "adaptive" };
+          requestParams.output_config = {
+            ...(requestParams.output_config || {}),
+            effort,
+          };
+        },
+        logMessage: `[anthropic-config] Adaptive thinking enabled with effort: ${effort}`,
+      };
+    }
+    // `between_tools` takes no other field and is valid only at effort high
+    // or below (the default), so effort is not sent with it.
     return {
-      enabled: true,
+      thinkingOn: false,
+      maxTokens,
+      apply: (requestParams) => {
+        requestParams.thinking = { type: "between_tools" };
+      },
+    };
+  }
+
+  if (!wantsThinking || forceToolUse) {
+    return { thinkingOn: false, maxTokens };
+  }
+
+  if (mode === "adaptive-optional") {
+    return {
+      thinkingOn: true,
       maxTokens: Math.max(maxTokens, MAX_TOKENS_WITH_THINKING),
       apply: (requestParams) => {
         requestParams.thinking = { type: "adaptive" };
@@ -210,10 +312,10 @@ function resolveClaudeThinkingConfig({
     };
   }
 
-  const legacyEffort = effort === "xhigh" ? "high" : effort;
-  const budgetTokens = THINKING_BUDGET[legacyEffort];
+  const legacyEffort = effort === "xhigh" ? "high" : effort!;
+  const budgetTokens = THINKING_BUDGET[legacyEffort as "medium" | "high"];
   return {
-    enabled: true,
+    thinkingOn: true,
     maxTokens: Math.min(
       MAX_TOKENS_WITH_THINKING,
       Math.max(maxTokens, budgetTokens + 1024),
@@ -226,6 +328,49 @@ function resolveClaudeThinkingConfig({
     },
     logMessage: `[anthropic-config] Extended thinking enabled with budget: ${budgetTokens} tokens`,
   };
+}
+
+const REQUIRED_TOOL_INSTRUCTION =
+  "Respond by calling one of the provided tools. Do not answer in plain text.";
+
+/**
+ * Turn non-answers into errors so callers release the credit hold instead of
+ * billing them: a refusal (stop_reason "refusal"), output cut off at
+ * max_tokens, or a missing tool call the caller required. Previously a
+ * refusal returned empty text as success, was billed, and the app retried
+ * and was billed again.
+ */
+export class ClaudeIncompleteResponseError extends Error {
+  constructor(
+    readonly reason: "refusal" | "max_tokens" | "missing_tool_call",
+    detail?: string,
+  ) {
+    super(
+      `Claude response not usable (${reason}${detail ? `: ${detail}` : ""})`,
+    );
+    this.name = "ClaudeIncompleteResponseError";
+  }
+}
+
+export function assertClaudeCompletion(
+  response: { stop_reason?: string | null; stop_details?: any; content?: any[] },
+  { requireToolCall = false }: { requireToolCall?: boolean } = {},
+): void {
+  if (response?.stop_reason === "refusal") {
+    throw new ClaudeIncompleteResponseError(
+      "refusal",
+      response?.stop_details?.category ?? undefined,
+    );
+  }
+  if (response?.stop_reason === "max_tokens") {
+    throw new ClaudeIncompleteResponseError("max_tokens");
+  }
+  if (
+    requireToolCall &&
+    !(response?.content || []).some((block: any) => block?.type === "tool_use")
+  ) {
+    throw new ClaudeIncompleteResponseError("missing_tool_call");
+  }
 }
 
 export interface ClaudeTranslateOptions {
@@ -265,21 +410,24 @@ export async function translateWithClaude({
   const client = makeAnthropic(apiKey);
   const hasTools = Array.isArray(tools) && tools.length > 0;
   const forceToolUse = hasTools && toolChoice === "required";
+  const capabilities = getClaudeModelCapabilities(model);
+  // Models that reject forced tool_choice get auto plus an instruction, and
+  // the response is checked for the required call below.
+  const instructToolUse = forceToolUse && !capabilities.forcedToolChoice;
 
   const { systemPrompt, anthropicMessages } = toAnthropicMessages(
     messages as ChatToolMessage[],
   );
 
   // Anthropic rejects forced tool_choice combined with thinking. The tool
-  // contract wins: drop thinking for this call rather than silently
-  // downgrading a required tool call to auto.
-  const thinkingConfig: ClaudeThinkingConfig = forceToolUse
-    ? { enabled: false, maxTokens }
-    : resolveClaudeThinkingConfig({
-        model,
-        maxTokens,
-        effort,
-      });
+  // contract wins: thinking is dropped for a forced call where the model
+  // allows it (resolveClaudeThinkingConfig handles models that always think).
+  const thinkingConfig = resolveClaudeThinkingConfig({
+    model,
+    maxTokens,
+    effort,
+    forceToolUse,
+  });
 
   // Build request parameters
   const requestParams: any = {
@@ -288,34 +436,47 @@ export async function translateWithClaude({
     messages: anthropicMessages,
   };
 
+  const effectiveSystemPrompt = instructToolUse
+    ? [systemPrompt, REQUIRED_TOOL_INSTRUCTION].filter(Boolean).join("\n\n")
+    : systemPrompt;
+  const foldsSystemPrompt =
+    capabilities.thinking === "budget" ||
+    capabilities.thinking === "adaptive-optional";
+
   if (hasTools) {
     requestParams.tools = toAnthropicTools(tools!);
-    if (forceToolUse) {
+    if (forceToolUse && capabilities.forcedToolChoice) {
       requestParams.tool_choice = { type: "any" };
     }
     // Tool flows need the system prompt intact — never fold it into the
     // first user turn.
-    if (systemPrompt) {
-      requestParams.system = systemPrompt;
+    if (effectiveSystemPrompt) {
+      requestParams.system = effectiveSystemPrompt;
     }
-  } else if (systemPrompt && !thinkingConfig.enabled) {
-    requestParams.system = systemPrompt;
-  } else if (systemPrompt && thinkingConfig.enabled) {
-    // Prepend system context to first user message when using extended thinking
+  } else if (
+    effectiveSystemPrompt &&
+    thinkingConfig.thinkingOn &&
+    foldsSystemPrompt
+  ) {
+    // Older models: prepend system context to the first user message when
+    // using extended thinking.
     const first = anthropicMessages[0];
     if (typeof first.content === "string") {
-      first.content = `${systemPrompt}\n\n${first.content}`;
+      first.content = `${effectiveSystemPrompt}\n\n${first.content}`;
     } else {
-      requestParams.system = systemPrompt;
+      requestParams.system = effectiveSystemPrompt;
     }
+  } else if (effectiveSystemPrompt) {
+    requestParams.system = effectiveSystemPrompt;
   }
 
-  if (thinkingConfig.enabled) {
+  if (thinkingConfig.apply) {
     thinkingConfig.apply(requestParams);
-    console.log(thinkingConfig.logMessage);
+    if (thinkingConfig.logMessage) console.log(thinkingConfig.logMessage);
   }
 
   const response = await client.messages.create(requestParams, { signal });
+  assertClaudeCompletion(response as any, { requireToolCall: forceToolUse });
 
   // Extract text content, handling both regular and thinking responses
   let textContent = '';

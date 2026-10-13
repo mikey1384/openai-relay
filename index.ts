@@ -1,10 +1,15 @@
 import { createServer } from "node:http";
 import { Buffer } from "node:buffer";
 import { makeOpenAI } from "./openai-config.js";
-import { makeAnthropic, translateWithClaude } from "./anthropic-config.js";
+import {
+  assertClaudeCompletion,
+  getClaudeModelCapabilities,
+  makeAnthropic,
+  resolveClaudeThinkingConfig,
+  translateWithClaude,
+} from "./anthropic-config.js";
 import {
   CF_API_BASE,
-  CLAUDE_OPUS_MODEL,
   DEFAULT_TRANSLATION_MODEL,
   isAllowedStage5TranslationModel,
   isClaudeModel,
@@ -349,54 +354,42 @@ async function translateWithClaudeWebSearch({
     userMessages.unshift({ role: "user", content: "Please proceed." });
   }
 
-  const useThinking = Boolean(effort && effort !== "low");
-  const useAdaptiveThinking = useThinking && model === CLAUDE_OPUS_MODEL;
-  const legacyEffort = effort === "xhigh" ? "high" : effort;
-  const thinkingBudget =
-    legacyEffort === "high" ? 16_000 : legacyEffort === "medium" ? 8_000 : 0;
+  const capabilities = getClaudeModelCapabilities(model);
   const resolvedMaxTokens =
     Number.isFinite(maxTokens) && Number(maxTokens) > 0
       ? Math.ceil(Number(maxTokens))
-      : useThinking
-        ? 32_000
-        : 16_000;
+      : 16_000;
+  const thinkingConfig = resolveClaudeThinkingConfig({
+    model,
+    maxTokens: resolvedMaxTokens,
+    effort,
+  });
   const requestParams: any = {
     model,
-    max_tokens: useThinking
-      ? Math.max(
-          resolvedMaxTokens,
-          useAdaptiveThinking ? 32_000 : thinkingBudget + 1024,
-        )
-      : resolvedMaxTokens,
+    max_tokens: thinkingConfig.maxTokens,
     messages: userMessages,
     tools: [
       {
-        type: "web_search_20250305",
+        type: capabilities.webSearchTool,
         name: "web_search",
       },
     ],
   };
 
-  if (systemPrompt && !useThinking) {
-    requestParams.system = systemPrompt;
-  } else if (systemPrompt && useThinking) {
+  const foldsSystemPrompt =
+    thinkingConfig.thinkingOn &&
+    (capabilities.thinking === "budget" ||
+      capabilities.thinking === "adaptive-optional");
+  if (systemPrompt && foldsSystemPrompt) {
     userMessages[0].content = `${systemPrompt}\n\n${userMessages[0].content}`;
+  } else if (systemPrompt) {
+    requestParams.system = systemPrompt;
   }
 
-  if (useAdaptiveThinking) {
-    requestParams.thinking = { type: "adaptive" };
-    requestParams.output_config = {
-      ...(requestParams.output_config || {}),
-      effort,
-    };
-  } else if (useThinking) {
-    requestParams.thinking = {
-      type: "enabled",
-      budget_tokens: thinkingBudget,
-    };
-  }
+  thinkingConfig.apply?.(requestParams);
 
   const response: any = await client.messages.create(requestParams);
+  assertClaudeCompletion(response);
   let content = "";
   for (const block of response?.content || []) {
     if (block?.type === "text" && typeof block?.text === "string") {

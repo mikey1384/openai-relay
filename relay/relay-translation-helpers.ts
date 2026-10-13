@@ -1,3 +1,4 @@
+import { claudeModelAlwaysThinks } from "../anthropic-config.js";
 import {
   CLAUDE_OPUS_MODEL,
   DEFAULT_TRANSLATION_MODEL,
@@ -175,7 +176,9 @@ export function resolveTranslationReservationMaxCompletionTokens({
   const effort = String(reasoning?.effort || "").trim().toLowerCase();
   const deepReasoning =
     effort === "medium" || effort === "high" || effort === "xhigh";
-  if (isClaudeModel(model) && deepReasoning) {
+  // Models that always think (Opus 5.5) need room for reasoning tokens until
+  // measured production data sizes a tighter cap.
+  if (isClaudeModel(model) && (deepReasoning || claudeModelAlwaysThinks(model))) {
     return EXTENDED_TRANSLATION_MAX_COMPLETION_TOKENS;
   }
   // Reasoning, tool calls and web search can legitimately produce output
