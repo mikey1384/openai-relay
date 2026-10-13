@@ -1,5 +1,8 @@
 import { claudeModelAlwaysThinks } from "../anthropic-config.js";
-import { STAGE5_CLAUDE_OPUS_5_5_MODEL } from "../model-catalog.js";
+import {
+  STAGE5_CLAUDE_HAIKU_5_5_MODEL,
+  STAGE5_CLAUDE_OPUS_5_5_MODEL,
+} from "../model-catalog.js";
 import {
   DEFAULT_TRANSLATION_MODEL,
   isClaudeModel,
@@ -128,17 +131,19 @@ export function resolveTranslationModel({
             ? "review"
             : "draft";
 
-  // Credit-mode review uses Anthropic's current Opus at the comparable price
-  // tier: on the 2026-10-13 trial Opus 5.5 cost about half of GPT-5.5 and was
-  // more complete and consistent. GPT-5.5 remains only the fallback when
-  // Anthropic is unavailable; GPT choices belong to API-key users, whose
-  // requests don't come through Stage5.
+  // Credit-mode subtitles use Anthropic's current models (2026-10-13 trials):
+  // review on Opus 5.5 (about half of GPT-5.5's cost, more complete and
+  // consistent), drafts on Haiku 5.5 (about a tenth of GPT-5.1's cost). The
+  // GPT models remain only as the fallback when Anthropic is unavailable; GPT
+  // choices belong to API-key users, whose requests don't come through Stage5.
   const selectedModel =
     effectivePhase === "review"
       ? canUseAnthropic
         ? STAGE5_CLAUDE_OPUS_5_5_MODEL
         : STAGE5_REVIEW_MODEL
-      : DEFAULT_TRANSLATION_MODEL;
+      : canUseAnthropic
+        ? STAGE5_CLAUDE_HAIKU_5_5_MODEL
+        : DEFAULT_TRANSLATION_MODEL;
 
   if (selectedModel !== normalized) {
     console.log(

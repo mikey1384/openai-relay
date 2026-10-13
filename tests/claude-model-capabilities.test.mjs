@@ -167,10 +167,11 @@ test('Haiku 5.5 turns thinking off explicitly and keeps forced tool use', async 
   assert.deepEqual(requests[0].tool_choice, { type: 'any' });
 });
 
-test('credit-mode review uses Opus 5.5 when Anthropic is available, GPT-5.5 otherwise', () => {
+test('credit-mode subtitles use Haiku 5.5 drafts and Opus 5.5 review when Anthropic is available, GPT otherwise', () => {
   const review = { translationPhase: 'review', messages: [{ role: 'user', content: 'x' }] };
   assert.equal(helpers.resolveTranslationModel({ ...review, canUseAnthropic: true, modelFamily: 'gpt' }), 'claude-opus-5-5');
   assert.equal(helpers.resolveTranslationModel({ ...review, canUseAnthropic: true }), 'claude-opus-5-5');
   assert.equal(helpers.resolveTranslationModel({ ...review, canUseAnthropic: false, modelFamily: 'claude' }), 'gpt-5.5');
-  assert.equal(helpers.resolveTranslationModel({ translationPhase: 'draft', messages: [], canUseAnthropic: true }), 'gpt-5.1');
+  assert.equal(helpers.resolveTranslationModel({ translationPhase: 'draft', messages: [], canUseAnthropic: true }), 'claude-haiku-5-5');
+  assert.equal(helpers.resolveTranslationModel({ translationPhase: 'draft', messages: [], canUseAnthropic: false }), 'gpt-5.1');
 });
